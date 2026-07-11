@@ -211,7 +211,7 @@ pub struct ExtractedImage {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,

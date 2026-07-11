@@ -29,6 +29,10 @@ pub mod conversion;
 #[doc(hidden)]
 pub mod extract;
 #[doc(hidden)]
+pub mod extraction_unit;
+#[doc(hidden)]
+pub mod extractor;
+#[doc(hidden)]
 pub mod figure_cluster;
 #[doc(hidden)]
 pub mod font_cmap;
@@ -43,6 +47,8 @@ pub mod markdown_layout;
 pub mod ocr;
 #[doc(hidden)]
 pub mod ocr_merge;
+#[doc(hidden)]
+pub mod offset_map;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]

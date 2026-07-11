@@ -21,7 +21,7 @@ tesseract = ["dep:tesseract-rs"]
 # Phase 2). Default-on for native builds; binding crates (wasm/napi/python) use
 # `default-features = false` and opt in when their extract surface lands.
 # BM25-only extraction stays available without this feature.
-static-embed = ["dep:tokenizers", "dep:safetensors"]
+static-embed = ["dep:tokenizers", "dep:safetensors", "dep:memmap2"]
 
 [dependencies]
 blake3 = "1"
@@ -46,6 +46,9 @@ safetensors = { version = "0.6", optional = true }
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# mmap-backed weight loading for static-embed: near-zero load time, rows page
+# in lazily. wasm falls back to the owned-buffer path.
+memmap2 = { version = "0.9", optional = true }
 rmp = "0.8"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "process"] }
 

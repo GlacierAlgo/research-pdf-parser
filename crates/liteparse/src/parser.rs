@@ -208,6 +208,123 @@ impl LiteParse {
         self.parse_input(PdfInput::Path(input.to_string())).await
     }
 
+    /// Schema extraction: parse `input`, then extract every field of a
+    /// **standard JSON Schema** from it — nested objects flatten to dotted
+    /// names, `array<object>` groups row-group over detected tables.
+    ///
+    /// The contract is **narrowing signal with provenance**, not LLM-grade
+    /// extraction: each field returns top-k candidate spans with an unitless
+    /// score, a page, a bbox, and a coarse [`Signal`](crate::extractor::Signal)
+    /// tier to branch on (act on `strong` / verify `weak` / escalate `none`).
+    /// Values are verbatim spans — normalization is deliberately out of scope.
+    ///
+    /// Engine knobs live on [`LiteParseConfig`]: `extract_fusion` (`auto` =
+    /// BM25 ∪ static embedding; `bm25` needs no model at all), `extract_model`
+    /// / `extract_model_path` (local files preferred; downloaded on first use
+    /// on native builds — any resolution/download failure logs and degrades to
+    /// BM25), `extract_top_k`.
+    pub async fn extract(
+        &self,
+        input: PdfInput,
+        schema: &serde_json::Value,
+    ) -> Result<crate::extractor::DocumentExtraction, LiteParseError> {
+        use crate::extractor::{
+            ArrayFieldResult, DocumentExtraction, ExtractionSchema, LocalExtractor,
+            ObjectArraySchema, schema_json, table_units,
+        };
+
+        let flat = schema_json::flatten_json_schema(schema);
+        if flat.fields.is_empty() && flat.object_arrays.is_empty() {
+            return Err("schema flattened to 0 extractable fields — \
+                 check for $ref shapes the flattener doesn't resolve"
+                .into());
+        }
+
+        let parsed = self.parse_input(input).await?;
+
+        #[cfg_attr(not(feature = "static-embed"), allow(unused_mut))]
+        let mut extractor = LocalExtractor::from_pages(&parsed.pages)
+            .with_fusion(self.config.extract_fusion)
+            .with_top_k(self.config.extract_top_k);
+        // Attach the static embedder unless the caller asked for pure BM25 (the
+        // zero-download path). Resolution prefers local files (explicit path,
+        // env var, HF cache, prior download); a full miss downloads on first
+        // use (native builds, tessdata pattern). Any failure degrades to BM25.
+        #[cfg(feature = "static-embed")]
+        if self.config.extract_fusion != crate::extractor::FusionMode::Bm25 {
+            use crate::extractor::static_embed::{StaticEmbedder, resolve_model_dir};
+            let explicit = self
+                .config
+                .extract_model_path
+                .as_deref()
+                .map(std::path::Path::new);
+            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+            let mut dir = resolve_model_dir(&self.config.extract_model, explicit);
+            #[cfg(not(target_arch = "wasm32"))]
+            if dir.is_none() {
+                match crate::extractor::model_fetch::ensure_model(
+                    &self.config.extract_model,
+                    explicit,
+                    self.config.quiet,
+                )
+                .await
+                {
+                    Ok(d) => dir = Some(d),
+                    Err(e) if !self.config.quiet => {
+                        eprintln!("extract: {e} — running BM25-only");
+                    }
+                    _ => {}
+                }
+            }
+            match dir.as_deref().map(StaticEmbedder::load) {
+                Some(Ok(e)) => extractor = extractor.with_embedder(std::sync::Arc::new(e)),
+                Some(Err(e)) if !self.config.quiet => {
+                    eprintln!("extract: embedding model failed to load ({e}) — running BM25-only");
+                }
+                None if !self.config.quiet && cfg!(target_arch = "wasm32") => {
+                    eprintln!(
+                        "extract: model '{}' not found locally — running BM25-only \
+                         (set LITEPARSE_EXTRACT_MODEL_PATH)",
+                        self.config.extract_model
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Scalar leaves: extract, then rename to dotted output paths (the
+        // engine query used the leaf name; the caller sees the full path).
+        let engine_schema = ExtractionSchema {
+            fields: flat.fields.iter().map(|f| f.to_schema_field()).collect(),
+        };
+        let mut fields = extractor.extract(&engine_schema).fields;
+        for (out, leaf) in fields.iter_mut().zip(&flat.fields) {
+            out.name = leaf.dotted();
+        }
+
+        // Object-array groups: row-group over detected tables (grids built once,
+        // shared). Record sub-fields are renamed to record-relative dotted paths.
+        let grids = table_units::table_grids(&parsed.pages);
+        let arrays = flat
+            .object_arrays
+            .iter()
+            .map(|oa| {
+                let group = ObjectArraySchema {
+                    fields: oa.fields.iter().map(|f| f.to_schema_field()).collect(),
+                    description: None,
+                };
+                let mut records = extractor.extract_object_array(&group, &grids).records;
+                for rec in &mut records {
+                    for (out, leaf) in rec.fields.iter_mut().zip(&oa.fields) {
+                        out.name = leaf.dotted();
+                    }
+                }
+                ArrayFieldResult::new(oa.dotted(), records)
+            })
+            .collect();
+
+        Ok(DocumentExtraction { fields, arrays })
+    }
+
     /// Parse a document from either a file path or raw bytes.
     ///
     /// Use `PdfInput::Path` for files on disk or `PdfInput::Bytes` for

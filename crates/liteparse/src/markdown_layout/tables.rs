@@ -1,4 +1,4 @@
-use crate::types::{GraphicPrimitive, ProjectedLine, Rect, TextItem};
+use crate::types::{GraphicPrimitive, ParsedPage, ProjectedLine, Rect, TextItem};
 
 use super::blocks::Block;
 use super::paragraphs::collapse_whitespace;
@@ -3653,6 +3653,49 @@ pub(super) fn merge_table_runs(
     }
     kept.sort_by_key(|r| r.start);
     kept
+}
+
+// ── Schema-extraction seam (row-grouping over detected tables) ─────────────────
+//
+// The schema-extraction engine's object-array path needs the confident cell
+// grids the markdown pass detects, but that pass discards them after rendering
+// (`Block::Table` collapses to a string). This read-only seam re-runs the same
+// detectors over a page and returns each text grid plus the projected-line
+// range it occupies, so the extractor can recover per-row provenance without
+// re-running detection itself or depending on detection internals. It changes
+// no parse output — additive, like the geometry-join pass.
+
+/// A confident table surfaced to the extraction engine: the text cell grid plus
+/// the `[line_start, line_end)` range into the page's `projected_lines` it came
+/// from. `GridFallback` (unclassifiable) runs are dropped — only pipe tables.
+#[derive(Debug, Clone)]
+pub(crate) struct DetectedTable {
+    pub(crate) header: Option<Vec<String>>,
+    pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) line_start: usize,
+    pub(crate) line_end: usize,
+}
+
+/// Re-run the ruled + borderless table detectors over `page` and return the
+/// confident pipe-table grids, combined exactly as `classify` combines them
+/// (`merge_table_runs`). Read-only; used only by the schema-extraction
+/// row-grouping path, never by the parse/markdown output.
+pub(crate) fn detect_page_tables(page: &ParsedPage) -> Vec<DetectedTable> {
+    let lines = &page.projected_lines;
+    let ruled = detect_ruled_tables(lines, &page.graphics, page.page_width, page.page_height);
+    let borderless = detect_tables(lines);
+    merge_table_runs(ruled, borderless)
+        .into_iter()
+        .filter_map(|run| match run.block {
+            Block::Table { header, rows } => Some(DetectedTable {
+                header,
+                rows,
+                line_start: run.start,
+                line_end: run.end,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Escape `|` and `\n` inside a markdown table cell so the pipe-table grammar

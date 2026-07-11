@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use liteparse::config::{LiteParseConfig, OutputFormat};
 use liteparse::conversion;
 use liteparse::extract;
+use liteparse::extractor::FusionMode;
 use liteparse::output::{json, text};
 use liteparse::parser::LiteParse;
 use liteparse::render;
@@ -28,12 +29,102 @@ enum Commands {
     BatchParse(BatchParseCommand),
     /// Check if a document is "complex" enough to require OCR or other advanced parsing
     IsComplex(IsComplexCommand),
+    /// Extract schema fields from a document: candidate values with scores,
+    /// pages, and bounding boxes (narrowing signal + provenance, not LLM-grade answers)
+    Extract(ExtractSchemaCommand),
+    /// Manage extraction embedding models (pre-fetch with `models pull`)
+    Models(ModelsCommand),
     /// Extract raw text items from a PDF file (no grid projection) [dev tool]
     #[command(hide = true)]
-    Extract(ExtractCommand),
+    ExtractItems(ExtractCommand),
     /// Extract embedded image bounding boxes from a page [dev tool]
     #[command(hide = true)]
     ImageBounds(ExtractCommand),
+}
+
+#[derive(Args, Debug)]
+struct ExtractSchemaCommand {
+    /// Input file path (PDF, DOCX, XLSX, images, etc.)
+    file: String,
+
+    /// Path to a standard JSON Schema describing the fields to extract.
+    /// Nested objects flatten to dotted field names; array-of-object groups
+    /// (e.g. line_items) extract one record per detected table row. Field
+    /// `description`s drive retrieval; `enum`/`format` sharpen the value path.
+    #[arg(long)]
+    schema: String,
+
+    /// Output file path (stdout if omitted)
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Compact JSON output (default is pretty-printed)
+    #[arg(long)]
+    compact: bool,
+
+    /// Candidate spans returned per field
+    #[arg(long, default_value = "5")]
+    top_k: usize,
+
+    /// Ranking fusion: "auto" (BM25 + embedding), "bm25" (lexical only — needs
+    /// no model), or "embed" (embedding only, for paraphrastic queries)
+    #[arg(long, default_value = "auto")]
+    fusion: String,
+
+    /// Static embedding model (Hugging Face id; local files preferred —
+    /// LITEPARSE_EXTRACT_MODEL_PATH, the HF cache, or a prior download —
+    /// else downloaded on first use; pre-fetch with `lit models pull`)
+    #[arg(long, default_value = "minishlab/potion-retrieval-32M")]
+    model: String,
+
+    /// Explicit local model directory (overrides --model resolution)
+    #[arg(long)]
+    model_path: Option<String>,
+
+    /// Disable OCR
+    #[arg(long)]
+    no_ocr: bool,
+
+    /// Max pages to parse
+    #[arg(long, default_value = "1000")]
+    max_pages: usize,
+
+    /// Target pages (e.g., "1-5,10,15-20")
+    #[arg(long)]
+    target_pages: Option<String>,
+
+    /// Password for encrypted/protected documents
+    #[arg(long)]
+    password: Option<String>,
+
+    /// Suppress progress logging on stderr
+    #[arg(long)]
+    quiet: bool,
+}
+
+#[derive(Args, Debug)]
+struct ModelsCommand {
+    #[command(subcommand)]
+    command: ModelsCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsCommands {
+    /// Download an extraction embedding model to the liteparse model cache
+    /// (idempotent — resolves existing local copies first). Prints the model
+    /// directory.
+    Pull(ModelsPullCommand),
+}
+
+#[derive(Args, Debug)]
+struct ModelsPullCommand {
+    /// Hugging Face model id
+    #[arg(default_value = "minishlab/potion-retrieval-32M")]
+    model: String,
+
+    /// Suppress the download notice on stderr
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -495,6 +586,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Extract(cmd) => {
+            let fusion = match cmd.fusion.as_str() {
+                "auto" => FusionMode::Auto,
+                "bm25" => FusionMode::Bm25,
+                "embed" => FusionMode::Embed,
+                other => {
+                    return Err(format!("invalid --fusion '{}' (auto|bm25|embed)", other).into());
+                }
+            };
+            let schema: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cmd.schema)?)
+                    .map_err(|e| format!("invalid schema JSON ({}): {}", cmd.schema, e))?;
+
+            let config = LiteParseConfig {
+                ocr_enabled: !cmd.no_ocr,
+                max_pages: cmd.max_pages,
+                target_pages: cmd.target_pages,
+                password: cmd.password,
+                quiet: cmd.quiet,
+                extract_top_k: cmd.top_k,
+                extract_fusion: fusion,
+                extract_model: cmd.model,
+                extract_model_path: cmd.model_path,
+                ..Default::default()
+            };
+            let lp = LiteParse::new(config);
+            let result = lp.extract(PdfInput::Path(cmd.file), &schema).await?;
+
+            let json = if cmd.compact {
+                serde_json::to_string(&result)?
+            } else {
+                serde_json::to_string_pretty(&result)?
+            };
+            match cmd.output {
+                Some(path) => {
+                    std::fs::write(&path, &json)?;
+                    if !cmd.quiet {
+                        eprintln!("[liteparse] wrote extraction to {}", path);
+                    }
+                }
+                None => println!("{}", json),
+            }
+        }
+
+        Commands::Models(cmd) => match cmd.command {
+            ModelsCommands::Pull(pull) => {
+                #[cfg(feature = "static-embed")]
+                {
+                    let dir = liteparse::extractor::model_fetch::ensure_model(
+                        &pull.model,
+                        None,
+                        pull.quiet,
+                    )
+                    .await?;
+                    println!("{}", dir.display());
+                }
+                #[cfg(not(feature = "static-embed"))]
+                {
+                    let _ = pull;
+                    return Err(
+                        "this build was compiled without the `static-embed` feature; \
+                         extraction runs BM25-only and uses no model"
+                            .into(),
+                    );
+                }
+            }
+        },
+
+        Commands::ExtractItems(cmd) => {
             extract::extract(&cmd.pdf_path, cmd.page_num)?;
         }
 
