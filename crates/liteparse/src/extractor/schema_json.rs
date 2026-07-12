@@ -66,6 +66,12 @@ impl FlatField {
 pub struct FlatObjectArray {
     pub path: Vec<String>,
     pub fields: Vec<FlatField>,
+    /// The record schema itself contains an `array<object>` (at any depth).
+    /// A record that carries its own repeated group is a *container* describing
+    /// a table/section (census-style `tables[]` with `rows[]` inside), not a row
+    /// of one — the row-grouping path refuses such groups (see
+    /// `ObjectArraySchema::has_nested_groups`).
+    pub has_nested_groups: bool,
 }
 
 impl FlatObjectArray {
@@ -184,14 +190,17 @@ fn flatten(
             let (item_kind, item_node) = resolve(root, node.get("items").unwrap_or(&null));
             if let Kind::Object = item_kind {
                 // Record sub-fields, pathed relative to the record root. Nested
-                // object-arrays inside a record are v1-out-of-scope (ignored).
+                // object-arrays inside a record are v1-out-of-scope (not
+                // extracted) — but their *presence* is recorded: it marks the
+                // record as container-shaped, which gates row-grouping.
                 let mut fields = Vec::new();
-                let mut ignore = Vec::new();
-                flatten(root, item_node, &mut Vec::new(), &mut fields, &mut ignore);
+                let mut nested = Vec::new();
+                flatten(root, item_node, &mut Vec::new(), &mut fields, &mut nested);
                 if !fields.is_empty() {
                     object_arrays.push(FlatObjectArray {
                         path: path.clone(),
                         fields,
+                        has_nested_groups: !nested.is_empty(),
                     });
                 }
             } else if let Kind::Scalar = item_kind {
@@ -444,5 +453,55 @@ mod tests {
         let subs: Vec<String> = oa.fields.iter().map(|f| f.dotted()).collect();
         assert_eq!(subs, ["amount", "description"]);
         assert_eq!(oa.fields[0].field_type, FieldType::Number);
+        // A plain line_items record (scalar sub-fields only) is row-shaped.
+        assert!(!oa.has_nested_groups);
+    }
+
+    /// A record that carries its own repeated group (census-style `tables[]`
+    /// with `rows[]` inside) is flagged container-shaped, so row-grouping can
+    /// refuse it. A scalar-list sub-field (`htsus_numbers: string[]`) does NOT
+    /// trip the flag — real line-item rows legitimately carry those.
+    #[test]
+    fn nested_object_array_marks_container_shape() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tables": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "table_title": {"type": "string"},
+                            "rows": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"row_label": {"type": "string"}}
+                                }
+                            }
+                        }
+                    }
+                },
+                "line_items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "htsus_numbers": {"type": "array", "items": {"type": "string"}}
+                        }
+                    }
+                }
+            }
+        });
+        let flat = flatten_json_schema(&schema);
+        let by_path = |p: &str| {
+            flat.object_arrays
+                .iter()
+                .find(|oa| oa.dotted() == p)
+                .unwrap()
+        };
+        assert!(by_path("tables").has_nested_groups);
+        assert!(!by_path("line_items").has_nested_groups);
     }
 }

@@ -47,7 +47,8 @@ struct ExtractSchemaCommand {
     /// Input file path (PDF, DOCX, XLSX, images, etc.)
     file: String,
 
-    /// Path to a standard JSON Schema describing the fields to extract.
+    /// A standard JSON Schema describing the fields to extract: either a path
+    /// to a schema file, or an inline JSON string (anything starting with `{`).
     /// Nested objects flatten to dotted field names; array-of-object groups
     /// (e.g. line_items) extract one record per detected table row. Field
     /// `description`s drive retrieval; `enum`/`format` sharpen the value path.
@@ -594,9 +595,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!("invalid --fusion '{}' (auto|bm25|embed)", other).into());
                 }
             };
-            let schema: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&cmd.schema)?)
-                    .map_err(|e| format!("invalid schema JSON ({}): {}", cmd.schema, e))?;
+            // `--schema` accepts either a path to a JSON Schema file or an
+            // inline JSON Schema string. A JSON Schema root is always an
+            // object, so a leading `{` (after whitespace) is an unambiguous
+            // "this is inline" signal; anything else is treated as a path.
+            let schema_text = if cmd.schema.trim_start().starts_with('{') {
+                cmd.schema.clone()
+            } else {
+                std::fs::read_to_string(&cmd.schema)?
+            };
+            let schema: serde_json::Value = serde_json::from_str(&schema_text)
+                .map_err(|e| format!("invalid schema JSON: {}", e))?;
 
             let config = LiteParseConfig {
                 ocr_enabled: !cmd.no_ocr,

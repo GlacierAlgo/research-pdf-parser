@@ -43,7 +43,6 @@ pub mod geometry_units;
 #[cfg(all(feature = "static-embed", not(target_arch = "wasm32")))]
 pub mod model_fetch;
 pub mod schema_json;
-mod span_search;
 #[cfg(feature = "static-embed")]
 pub mod static_embed;
 pub mod table_units;
@@ -121,12 +120,17 @@ pub struct Candidate {
     /// The full source unit text — always carried so callers can verify the
     /// span even once `value` is narrowed.
     pub text: String,
-    /// Raw, unitless fusion/BM25 score. Comparable *within a run* for ranking
-    /// and filtering; explicitly **not** a probability. See the plan's
-    /// "Scoring & ranking".
+    /// Relevance of this span to the field, in `[0,1]`, higher = closer. With
+    /// the embedding model it is cosine similarity to the field description
+    /// (absolute, comparable across documents — usable to gate a corpus); in
+    /// bm25-only mode it is a saturating squash of the lexical score (coarser,
+    /// comparable only within one run). Explicitly **not** a probability — for
+    /// a trust decision branch on [`FieldResult::signal`], not this number.
     pub score: f32,
     pub page: usize,
-    pub bbox: Rect,
+    /// `None` when the candidate's source row couldn't be resolved back to a
+    /// source line (some table rows) — never a made-up `{0,0,0,0}` box.
+    pub bbox: Option<Rect>,
     /// Which unit source produced this candidate (informational / debug).
     pub source: UnitSource,
     /// Did a type/format/enum scanner actually pull a value out (vs. `value`
@@ -139,9 +143,14 @@ pub struct Candidate {
 /// skip `none`. This is a **heuristic over observable value-path facts**, not a
 /// calibrated confidence (scores stay unitless, see the plan's "Scoring &
 /// ranking"): `strong` means a value-shaped scanner actually isolated the value
-/// (typed/format/enum match or a label-anchored cell), `weak` means the headline
-/// is a raw retrieved span the engine could not narrow, `none` means no answer
-/// (nothing retrieved, or an enum with no matching choice).
+/// (typed/format/enum match or a label-anchored cell) *on a span with lexical
+/// support or a real cosine to the query* — a value shape mined off an
+/// embed-only noise span does not qualify; `weak` means the headline is a raw
+/// retrieved span the engine could not narrow — but one with lexical support;
+/// `none` means no answer: nothing retrieved, an enum/format scanner that
+/// matched nowhere (never guess), or — under fused retrieval — a span nominated
+/// by the embedding alone, with no query token in it (`candidates` still carry
+/// the spans in the latter cases; only the value claim is withheld).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Signal {
@@ -158,6 +167,10 @@ pub struct FieldResult {
     pub value: Option<String>,
     /// How much to trust `value` — see [`Signal`].
     pub signal: Signal,
+    /// Relevance of the headline span in `[0,1]` (the top candidate's
+    /// [`Candidate::score`]): embedding cosine, or a squashed BM25 score in
+    /// bm25-only mode. A ranking/filtering aid, not a probability — trust is
+    /// [`signal`](Self::signal). `None` only on a miss.
     pub score: Option<f32>,
     pub page: Option<usize>,
     pub bbox: Option<Rect>,
@@ -199,6 +212,13 @@ pub struct ObjectArraySchema {
     /// yet consulted (v1 picks the best-matching detected table by header).
     #[serde(default)]
     pub description: Option<String>,
+    /// The record schema contains its own `array<object>` sub-group. Such a
+    /// record is a *container* describing a table or section (census-style
+    /// `tables[]` each carrying `rows[]`), not a row of one — row-grouping
+    /// refuses it rather than force-mapping meta fields (`table_title`…) onto
+    /// data columns. Set by `schema_json::flatten_json_schema`.
+    #[serde(default)]
+    pub has_nested_groups: bool,
 }
 
 /// One extracted record: a [`FieldResult`] per sub-field, in schema order.
@@ -219,20 +239,31 @@ pub struct ObjectArrayResult {
 pub struct ArrayFieldResult {
     pub name: String,
     /// `none` = no table matched (no records); `strong` = at least one record
-    /// resolved half or more of its sub-fields; `weak` = records exist but are
-    /// sparse (partial table detection or poor header matching).
+    /// resolved half or more of its sub-fields — at least two of them, at least
+    /// one value-shaped (a sub-field with a `strong` signal of its own); `weak`
+    /// = records exist but are sparse (partial table detection or poor header
+    /// matching), or nothing in them is value-shaped.
     pub signal: Signal,
     pub records: Vec<Record>,
 }
 
 impl ArrayFieldResult {
     pub(crate) fn new(name: String, records: Vec<Record>) -> Self {
+        // A raw non-empty cell always yields *a* value, so "values present"
+        // alone over-promises (one junk record resolving 1 of 2 sub-fields used
+        // to read `strong`). Demand density (≥ half, ≥ 2 — a single resolved
+        // cell is never corroboration unless the record only HAS one field) and
+        // shape (some cell the scanners actually isolated).
+        let record_is_strong = |r: &Record| {
+            let resolved = r.fields.iter().filter(|f| f.value.is_some()).count();
+            resolved * 2 >= r.fields.len()
+                && resolved >= 2.min(r.fields.len())
+                && resolved > 0
+                && r.fields.iter().any(|f| f.signal == Signal::Strong)
+        };
         let signal = if records.is_empty() {
             Signal::None
-        } else if records.iter().any(|r| {
-            !r.fields.is_empty()
-                && r.fields.iter().filter(|f| f.value.is_some()).count() * 2 >= r.fields.len()
-        }) {
+        } else if records.iter().any(record_is_strong) {
             Signal::Strong
         } else {
             Signal::Weak
@@ -401,6 +432,29 @@ pub enum FusionMode {
 /// RRF constant, matching the Python reference (`crux.py` `RRF_K`).
 const RRF_K: f32 = 60.0;
 
+/// Saturating constant for [`squash_bm25`]. BM25 sums are unbounded and
+/// query-length dependent, so there is no principled max to divide by; `s/(s+K)`
+/// maps a "decent" top-1 match (~K) to ~0.5 and saturates toward 1. Chosen by
+/// eyeballing top-1 scores on the demo corpus — a coarse ruler, not a calibrated
+/// one (the honest cross-run trust signal is [`Signal`], not this number).
+const BM25_SQUASH_K: f32 = 3.0;
+
+/// Squash an unbounded BM25 score into `(0, 1)`, monotonically. Used for the
+/// bm25-only value path and for detected-table cell scores (whose column match
+/// is always lexical). Comparable only *within* a bm25 run.
+fn squash_bm25(score: f32) -> f32 {
+    let s = score.max(0.0);
+    s / (s + BM25_SQUASH_K)
+}
+
+/// Cosine floor below which an *unanchored* typed hit is refused `strong`
+/// (the typed-hit anchor gate in `extract_field`). Only consulted under fused
+/// retrieval with an embedder, where the rescored candidate score IS the
+/// query↔span cosine. Dogfood fabrications (digit runs mined off garbled-OCR /
+/// off-topic spans) all sat at ≤ 0.13; the legitimate embed-only typed hits
+/// observed sit ≥ 0.39. Midpoint with margin both ways.
+const TYPED_UNANCHORED_COSINE_FLOOR: f32 = 0.25;
+
 /// Reciprocal-rank-fuse two rankings over `n` units: each unit contributes
 /// `1/(RRF_K + position)` per ranking, summed. Units missing from a (sparse
 /// BM25) ranking take the tail positions in unit-index order — the Python
@@ -475,48 +529,8 @@ pub struct LocalExtractor {
     index: Bm25Index,
     top_k: usize,
     fusion: FusionMode,
-    /// Grid `page.text` rows (column-padded surface), kept for span_search's
-    /// label-anchored cell extraction. `projected_lines` collapse column gaps to
-    /// single spaces, so the plain-string value path looks the matching grid row
-    /// up by whitespace-collapsed text to recover the 2+ space cell structure the
-    /// mechanic keys on. Empty unless built via [`from_pages`](LocalExtractor::from_pages).
-    grid_lines: Vec<GridLine>,
     #[cfg(feature = "static-embed")]
     embed: Option<EmbedIndex>,
-}
-
-/// One row of the grid `page.text` surface, with its whitespace-collapsed form
-/// precomputed for matching against a retrieved unit's (single-spaced) text.
-struct GridLine {
-    page: usize,
-    text: String,
-    collapsed: String,
-}
-
-/// Collapse every run of whitespace to a single space (and trim). Used to match
-/// a column-padded grid row against a single-spaced projected-line unit.
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Index every non-blank grid `page.text` row, keyed by page, with its
-/// whitespace-collapsed form precomputed for lookup.
-fn build_grid_lines(pages: &[ParsedPage]) -> Vec<GridLine> {
-    let mut out = Vec::new();
-    for page in pages {
-        for line in page.text.lines() {
-            let collapsed = collapse_ws(line);
-            if collapsed.is_empty() {
-                continue;
-            }
-            out.push(GridLine {
-                page: page.page_number,
-                text: line.to_string(),
-                collapsed,
-            });
-        }
-    }
-    out
 }
 
 impl LocalExtractor {
@@ -533,9 +547,7 @@ impl LocalExtractor {
         let map = OffsetMap::build(pages);
         let mut units = natural_units(&map);
         units.extend(geometry_units::geometry_units(pages));
-        let mut extractor = LocalExtractor::from_units(map, units);
-        extractor.grid_lines = build_grid_lines(pages);
-        extractor
+        LocalExtractor::from_units(map, units)
     }
 
     /// Build from an explicit unit set (natural + future synthetic units). The
@@ -551,7 +563,6 @@ impl LocalExtractor {
             index,
             top_k: DEFAULT_TOP_K,
             fusion: FusionMode::default(),
-            grid_lines: Vec::new(),
             #[cfg(feature = "static-embed")]
             embed: None,
         }
@@ -629,23 +640,6 @@ impl LocalExtractor {
         &self.units
     }
 
-    /// The column-padded grid row on `page` corresponding to `unit_text` (a
-    /// single-spaced projected line), matched by whitespace-collapsed text —
-    /// exact first, then containment. `None` when no grid rows were indexed
-    /// (built via [`new`](LocalExtractor::new)/[`from_units`](LocalExtractor::from_units))
-    /// or nothing matches; the caller then uses `unit_text` unchanged.
-    fn grid_line_for(&self, page: usize, unit_text: &str) -> Option<&str> {
-        let target = collapse_ws(unit_text);
-        if target.is_empty() {
-            return None;
-        }
-        let on_page = || self.grid_lines.iter().filter(|g| g.page == page);
-        on_page()
-            .find(|g| g.collapsed == target)
-            .or_else(|| on_page().find(|g| g.collapsed.contains(&target)))
-            .map(|g| g.text.as_str())
-    }
-
     /// Extract every field in `schema`, in order.
     pub fn extract(&self, schema: &ExtractionSchema) -> ExtractResult {
         let fields = schema
@@ -657,12 +651,16 @@ impl LocalExtractor {
     }
 
     fn extract_field(&self, field: &SchemaField) -> FieldResult {
-        let ranked = self.rank(&field.query());
+        let query = field.query();
+        let ranked = self.rank(&query);
 
         // Build candidates, resolving provenance and deduping on unit text.
         // A field can retrieve the same text via distinct units (e.g. a natural
         // line and a synthetic join over the same items) — collapse those.
+        // `cand_docs` remembers each candidate's unit index (parallel vec) so
+        // the signal tier can ask the BM25 side about it afterwards.
         let mut candidates: Vec<Candidate> = Vec::new();
+        let mut cand_docs: Vec<usize> = Vec::new();
         let mut seen_text = std::collections::HashSet::new();
         for (doc, score) in ranked {
             if candidates.len() >= self.top_k {
@@ -688,81 +686,134 @@ impl LocalExtractor {
                 text: unit.text.clone(),
                 score,
                 page: prov.page,
-                bbox: prov.bbox,
+                bbox: Some(prov.bbox),
                 source: unit.source,
                 typed_match,
             });
+            cand_docs.push(doc);
         }
 
-        // Plain-string value path: label-anchored cell extraction. For untyped
-        // string fields (no enum/format) the baseline value is the whole
-        // label-stripped span; span_search narrows it to the value cell that
-        // follows the matching label. Top unit only (SPAN_TOPK = 1); degrades to
-        // a pure-lexical score when no embedder is attached.
-        if !candidates.is_empty() && is_plain_string(field) && span_search_enabled() {
-            let qterms = span_search::label_terms_for(&field.name, field.description.as_deref());
-            // span_search keys on 2+ space column gaps; the retrieved unit came
-            // from projected_lines (gaps collapsed), so recover the column-padded
-            // grid row for this line. Falls back to the unit text when no grid row
-            // matches (e.g. built without pages, or projection/grid diverged).
-            let top = &candidates[0];
-            let top_text = self
-                .grid_line_for(top.page, &top.text)
-                .unwrap_or(&top.text)
-                .to_string();
-            #[cfg(feature = "static-embed")]
-            let q_emb: Option<Vec<f32>> = self
-                .embed
-                .as_ref()
-                .map(|e| e.embedder.embed(&field.query()));
-            let embed_cells = |cells: &[String]| -> Option<Vec<f32>> {
-                #[cfg(feature = "static-embed")]
-                {
-                    if let (Some(e), Some(q)) = (self.embed.as_ref(), q_emb.as_ref()) {
-                        return Some(cells.iter().map(|c| dot(&e.embedder.embed(c), q)).collect());
-                    }
-                }
-                let _ = cells;
-                None
-            };
-            if let Some(v) = span_search::span_search(&top_text, &qterms, embed_cells) {
-                candidates[0].value = v;
-                // A label-anchored cell hit IS a value isolation — count it for
-                // the signal tier. Safe for headline selection: span_search only
-                // fires on plain strings, where typed_value never fires, so the
-                // headline is index 0 either way.
-                candidates[0].typed_match = true;
-            }
-        }
+        // Plain-string fields (no enum/format) keep the whole label-stripped
+        // span as their value — a complete, verifiable narrowing signal rather
+        // than a mined value cell. `strong` is reserved for the type-anchored
+        // scanners below; a raw string span reads `weak` (see the signal tier).
 
         if candidates.is_empty() {
             return FieldResult::miss(&field.name);
         }
 
-        // Headline = the highest-ranked candidate that actually yielded a typed
-        // value ("pick a value-bearing candidate from top-k, not blind top-1"),
-        // else fall back to rank 0. For enum fields with no match anywhere the
-        // field value is null — enum never guesses — but the top retrieved span
-        // is still surfaced for provenance.
-        let headline = candidates.iter().position(|c| c.typed_match).unwrap_or(0);
-        let enum_no_match = !field.choices.is_empty() && !candidates.iter().any(|c| c.typed_match);
+        // Replace the raw ranking score with a [0,1] relevance for output. The
+        // fusion score above chose the ordering; callers get a comparable number.
+        self.rescore_relevance(&query, &mut candidates, &cand_docs);
+
+        // Typed-hit anchor gate (`LITEPARSE_EXTRACT_TYPED_ANCHOR_GATE=0` to
+        // disable): a scanner hit counts only if its span has lexical support
+        // or a real cosine to the query. Without the gate, fused retrieval let
+        // embed-only noise wearing a value shape (a street number, a garbled
+        // OCR digit run) promote straight to `strong` on a span sharing zero
+        // query tokens at near-zero cosine.
+        let anchored = self.anchored_flags(&query, &cand_docs);
+        let anchor_gate = gate_enabled("LITEPARSE_EXTRACT_TYPED_ANCHOR_GATE");
+        let typed_ok = |i: usize| {
+            candidates[i].typed_match
+                && (!anchor_gate
+                    || anchored[i]
+                    || candidates[i].score >= TYPED_UNANCHORED_COSINE_FLOOR)
+        };
+        // Headline = the highest-ranked candidate whose typed value survives
+        // the gate ("pick a value-bearing candidate from top-k, not blind
+        // top-1"), else fall back to rank 0.
+        let headline = (0..candidates.len()).find(|&i| typed_ok(i)).unwrap_or(0);
         let h = &candidates[headline];
-        let signal = if enum_no_match {
+        // Value-shaped scanners never guess: an enum with no supported choice,
+        // or an *implemented* `format` scanner (email/uri/date) that found its
+        // shape nowhere in the top-k, means the answer is null — not the raw
+        // span. (A format keyword we have no scanner for imposes no such claim.)
+        let scanner_no_match = !(0..candidates.len()).any(typed_ok)
+            && (!field.choices.is_empty()
+                || field
+                    .format
+                    .as_deref()
+                    .is_some_and(value_span::has_format_scanner));
+        let signal = if scanner_no_match {
             Signal::None
-        } else if h.typed_match {
+        } else if typed_ok(headline) {
             Signal::Strong
+        } else if !anchored[headline] {
+            // Fused (auto) retrieval is dense — the cosine side always
+            // nominates a neighbor — so a span with zero BM25 support is
+            // embed-only noise pure BM25 would have answered with a clean
+            // miss (this covers both raw spans and gated-out typed hits).
+            // Report `none` honestly; the spans stay in `candidates`.
+            Signal::None
         } else {
             Signal::Weak
         };
+        // The headline value is claimed only when the signal claims an answer;
+        // `none` keeps the retrieved spans for provenance but no value.
         FieldResult {
             name: field.name.clone(),
-            value: (!enum_no_match).then(|| h.value.clone()),
+            value: (signal != Signal::None).then(|| h.value.clone()),
             signal,
             score: Some(h.score),
             page: Some(h.page),
-            bbox: Some(h.bbox.clone()),
+            bbox: h.bbox.clone(),
             candidates,
         }
+    }
+
+    /// Rewrite each candidate's `score` into a documented `[0,1]` relevance,
+    /// replacing the raw (unitless, mode-dependent) fusion/BM25 score that drove
+    /// ranking. With an embedder in play (auto/embed fusion) the score becomes
+    /// the **cosine similarity** of the field query to the candidate's unit
+    /// vector — an absolute match strength that is comparable across documents
+    /// (so it can gate a corpus: "keep docs scoring > 0.5 for this field").
+    /// Otherwise it is a saturating [`squash_bm25`] of the raw BM25 score —
+    /// monotonic but coarser, comparable only within one bm25 run. Neither is a
+    /// probability; the cross-run trust signal is [`Signal`].
+    ///
+    /// `docs[i]` is `candidates[i]`'s unit index (the parallel vec the caller
+    /// already tracks). Cosine is decoupled from the RRF *ranking* on purpose:
+    /// fusion decides which span wins; this reports how close that span is.
+    fn rescore_relevance(&self, query: &str, candidates: &mut [Candidate], docs: &[usize]) {
+        #[cfg(feature = "static-embed")]
+        if self.fusion != FusionMode::Bm25
+            && let Some(embed) = &self.embed
+        {
+            let q = embed.embedder.embed(query);
+            for (c, &doc) in candidates.iter_mut().zip(docs) {
+                let row = &embed.vecs[doc * embed.dim..(doc + 1) * embed.dim];
+                let cos: f32 = row.iter().zip(&q).map(|(a, b)| a * b).sum();
+                c.score = cos.clamp(0.0, 1.0);
+            }
+            return;
+        }
+        let _ = (query, docs);
+        for c in candidates.iter_mut() {
+            c.score = squash_bm25(c.score);
+        }
+    }
+
+    /// Per-candidate lexical anchoring: is each unit in the BM25 ranking for
+    /// `query` (shares at least one token)? One scoring pass for the whole
+    /// candidate set. Only meaningful in fused (Auto) mode with an embedder
+    /// attached — the one configuration where a candidate can appear with no
+    /// lexical support at all; everywhere else the answer is all-true
+    /// (pure-BM25 candidates are anchored by construction, and explicit
+    /// `Embed` mode is the caller opting into cosine-only retrieval).
+    fn anchored_flags(&self, query: &str, docs: &[usize]) -> Vec<bool> {
+        #[cfg(feature = "static-embed")]
+        if self.embed.is_some() && self.fusion == FusionMode::Auto {
+            let hits: std::collections::HashSet<usize> = self
+                .index
+                .score(query)
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            return docs.iter().map(|d| hits.contains(d)).collect();
+        }
+        let _ = query;
+        vec![true; docs.len()]
     }
 
     // ── Object-array (row grouping) ──────────────────────────────────────────
@@ -776,23 +827,128 @@ impl LocalExtractor {
     /// Extract one [`Record`] per row of the detected table that best matches
     /// `group`, pulling each sub-field from its matched column. `grids` come from
     /// [`table_units::table_grids`]. Returns no records when no table's columns
-    /// match the schema (empty doc, no detected table, or no lexical overlap).
+    /// match the schema (empty doc, no detected table, or no lexical overlap),
+    /// or when the group is refused by the container-shape gate below.
+    ///
+    /// Two emission gates keep the output honest (each disable-able for A/B via
+    /// `LITEPARSE_EXTRACT_GROUP_GATE=0` / `LITEPARSE_EXTRACT_ROW_GATE=0`):
+    ///
+    /// - **Group gate:** a record schema that contains its own `array<object>`
+    ///   (`has_nested_groups`) describes tables, it isn't a row of one — header
+    ///   tokens leak into BM25 for *any* table ("number", a description's
+    ///   example phrases), so without this gate meta fields get force-mapped
+    ///   onto data columns and every body row becomes a garbage record.
+    /// - **Row gates:** a body row is dropped when (a) no mapped column has a
+    ///   non-empty cell (an all-null record carries no signal), or (b) every
+    ///   resolved cell merely echoes its own field name / column header — the
+    ///   signature of a wrapped header line binned as a body row ("At Closing"
+    ///   under `borrower_paid_at_closing`), not of data.
     pub fn extract_object_array(
         &self,
         group: &ObjectArraySchema,
         grids: &[table_units::TableGrid],
     ) -> ObjectArrayResult {
+        if group.has_nested_groups && gate_enabled("LITEPARSE_EXTRACT_GROUP_GATE") {
+            return ObjectArrayResult {
+                records: Vec::new(),
+            };
+        }
         let Some(matched) = best_grid_for(group, grids) else {
             return ObjectArrayResult {
                 records: Vec::new(),
             };
         };
+        debug_dump_matched_grid(group, &matched);
+        let header = grid_header(matched.grid)
+            .map(|(h, _)| h)
+            .unwrap_or_default();
+        let row_gate = gate_enabled("LITEPARSE_EXTRACT_ROW_GATE");
         let records = matched.grid.rows[matched.body_start..]
             .iter()
+            .filter(|row| {
+                !row_gate || !is_label_echo_row(&group.fields, row, &matched.mapping, &header)
+            })
             .map(|row| row_to_record(&group.fields, row, &matched.mapping, matched.grid.page))
+            // All-miss records carry nothing — not even a candidate span (an
+            // enum-no-match cell still surfaces its candidate, so it survives).
+            .filter(|rec| !row_gate || rec.fields.iter().any(|f| !f.candidates.is_empty()))
             .collect();
         ObjectArrayResult { records }
     }
+}
+
+/// `LITEPARSE_EXTRACT_DEBUG=1` stderr dump of an object-array grouping decision:
+/// which grid won, its header, and the column each sub-field mapped to. The
+/// row-grouping counterpart of `dump_geometry_units` / `dump_table_grids`.
+fn debug_dump_matched_grid(group: &ObjectArraySchema, matched: &MatchedGrid) {
+    if !std::env::var("LITEPARSE_EXTRACT_DEBUG").is_ok_and(|v| v != "0") {
+        return;
+    }
+    let header = grid_header(matched.grid)
+        .map(|(h, _)| h)
+        .unwrap_or_default();
+    eprintln!(
+        "[extract-debug] group{} → grid p{} ({} rows, body from {}), header: {:?}",
+        group
+            .description
+            .as_deref()
+            .map(|d| format!(" '{}'", &d[..d.len().min(60)]))
+            .unwrap_or_default(),
+        matched.grid.page,
+        matched.grid.rows.len(),
+        matched.body_start,
+        header
+    );
+    for (field, m) in group.fields.iter().zip(&matched.mapping) {
+        match m {
+            Some((col, score)) => eprintln!(
+                "[extract-debug]   {} → col {} {:?} (score {:.2})",
+                field.name,
+                col,
+                header.get(*col).map(String::as_str).unwrap_or("?"),
+                score
+            ),
+            None => eprintln!("[extract-debug]   {} → (unmapped)", field.name),
+        }
+    }
+}
+
+/// An emission gate is on unless its env var is explicitly `0` (the A/B
+/// disable convention, e.g. `LITEPARSE_EXTRACT_GROUP_GATE=0`).
+fn gate_enabled(var: &str) -> bool {
+    std::env::var(var).map_or(true, |v| v != "0")
+}
+
+/// A body row whose every resolved cell just echoes its own field's name tokens
+/// or its column's header tokens is a mis-binned (wrapped/continuation) header
+/// line, not data: "At Closing | Others" under `borrower_paid_at_closing` /
+/// `paid_by_others`. Real values ("405.00", "YES", "Application Fee") carry at
+/// least one token outside that label vocabulary. Field *descriptions* are
+/// deliberately not part of the vocabulary — bench-style descriptions embed
+/// example values verbatim, which would make real data look like an echo.
+fn is_label_echo_row(
+    fields: &[SchemaField],
+    row: &table_units::GridRow,
+    mapping: &[Option<(usize, f32)>],
+    header: &[String],
+) -> bool {
+    let mut resolved = 0usize;
+    for (field, m) in fields.iter().zip(mapping) {
+        let Some((col, _)) = m else { continue };
+        let Some(cell) = row.cells.get(*col).map(|c| c.trim()) else {
+            continue;
+        };
+        if cell.is_empty() {
+            continue;
+        }
+        resolved += 1;
+        let mut label_vocab: Vec<String> = tokenize(&field.name);
+        label_vocab.extend(tokenize(header.get(*col).map(String::as_str).unwrap_or("")));
+        if !tokenize(cell).iter().all(|t| label_vocab.contains(t)) {
+            return false; // a real (non-echo) value — keep the row
+        }
+    }
+    resolved > 0
 }
 
 /// The table chosen to group over, with its column→sub-field mapping and the
@@ -932,10 +1088,21 @@ fn cell_field_result(
     if cell.is_empty() {
         return FieldResult::miss(&field.name);
     }
+    // Column matching is lexical (BM25 over header cells), so the cell score is
+    // squashed into the same [0,1] relevance the bm25 scalar path reports.
+    let score = squash_bm25(score);
     let typed = value_span::typed_value(field, cell);
     let typed_match = typed.is_some();
     let value = typed.unwrap_or_else(|| value_span::fallback_value(cell));
-    let enum_no_match = !field.choices.is_empty() && !typed_match;
+    // Same never-guess rule as the scalar path: enum with no supported choice,
+    // or an implemented format scanner that found nothing, yields a null value
+    // (the cell still surfaces as a candidate).
+    let scanner_no_match = !typed_match
+        && (!field.choices.is_empty()
+            || field
+                .format
+                .as_deref()
+                .is_some_and(value_span::has_format_scanner));
 
     let page = provenance.map(|p| p.page).unwrap_or(grid_page);
     let bbox = provenance.map(|p| p.bbox.clone());
@@ -944,11 +1111,11 @@ fn cell_field_result(
         text: cell.to_string(),
         score,
         page,
-        bbox: bbox.clone().unwrap_or_default(),
+        bbox: bbox.clone(),
         source: UnitSource::HeaderCell,
         typed_match,
     };
-    let signal = if enum_no_match {
+    let signal = if scanner_no_match {
         Signal::None
     } else if typed_match {
         Signal::Strong
@@ -957,7 +1124,7 @@ fn cell_field_result(
     };
     FieldResult {
         name: field.name.clone(),
-        value: (!enum_no_match).then_some(value),
+        value: (!scanner_no_match).then_some(value),
         signal,
         score: Some(score),
         page: Some(page),
@@ -965,32 +1132,6 @@ fn cell_field_result(
         bbox,
         candidates: vec![candidate],
     }
-}
-
-/// A field whose value path is the plain-string branch: no enum, no format, and
-/// an untyped/string declared type. These are the fields [`span_search`] targets
-/// — typed/enum/format fields already resolve through [`value_span::typed_value`].
-fn is_plain_string(field: &SchemaField) -> bool {
-    matches!(field.field_type, FieldType::Str | FieldType::Other)
-        && field.choices.is_empty()
-        && field.format.is_none()
-}
-
-/// Label-anchored cell extraction is on by default — it *is* the plain-string
-/// value path (Phase 0 `Result 3d`). Set `LITEPARSE_EXTRACT_SPAN_SEARCH=0` to
-/// disable it for an A/B byte-diff against the label-stripped baseline.
-fn span_search_enabled() -> bool {
-    !matches!(
-        std::env::var("LITEPARSE_EXTRACT_SPAN_SEARCH").as_deref(),
-        Ok("0")
-    )
-}
-
-/// Dot product of two equal-length vectors. For L2-normalized model2vec
-/// embeddings this is the cosine similarity.
-#[cfg(feature = "static-embed")]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]
@@ -1240,6 +1381,7 @@ mod tests {
         let group = ObjectArraySchema {
             fields: vec![field("item", "the item name"), field("price", "unit price")],
             description: None,
+            has_nested_groups: false,
         };
         let grid = TableGrid {
             page: 1,
@@ -1273,6 +1415,7 @@ mod tests {
                 field("quantity", "quantity ordered"),
             ],
             description: None,
+            has_nested_groups: false,
         };
         let address = TableGrid {
             page: 1,
@@ -1297,6 +1440,7 @@ mod tests {
         let group = ObjectArraySchema {
             fields: vec![field("item", "the item")],
             description: None,
+            has_nested_groups: false,
         };
         let grid = TableGrid {
             page: 1,
@@ -1314,6 +1458,7 @@ mod tests {
         let group = ObjectArraySchema {
             fields: vec![field("item", "the item name"), field("price", "unit price")],
             description: None,
+            has_nested_groups: false,
         };
         let grid = TableGrid {
             page: 1,
@@ -1323,5 +1468,180 @@ mod tests {
         let out = ex.extract_object_array(&group, &[grid]);
         assert_eq!(out.records[0].fields[0].value.as_deref(), Some("Widget"));
         assert_eq!(out.records[0].fields[1].value, None);
+    }
+
+    /// A record schema that contains its own repeated group (census-style
+    /// `tables[]` carrying `rows[]`) is a container, not a table row — the
+    /// group gate refuses it instead of force-mapping meta fields onto data
+    /// columns.
+    #[test]
+    fn object_array_refuses_container_shaped_record() {
+        let ex = LocalExtractor::from_units(OffsetMap::default(), vec![]);
+        let group = ObjectArraySchema {
+            fields: vec![
+                field("table_number", "the printed table number"),
+                field("table_title", "the table title"),
+            ],
+            description: None,
+            has_nested_groups: true,
+        };
+        let grid = TableGrid {
+            page: 1,
+            header: Some(vec!["Number".to_string(), "Title of measure".to_string()]),
+            rows: vec![row(&["39,507", "Persons 65+"], 680.0)],
+        };
+        assert!(ex.extract_object_array(&group, &[grid]).records.is_empty());
+    }
+
+    /// Body rows where no mapped column has a non-empty cell would emit an
+    /// all-null record — dropped, they carry no signal at all.
+    #[test]
+    fn object_array_drops_all_null_rows() {
+        let ex = LocalExtractor::from_units(OffsetMap::default(), vec![]);
+        let group = ObjectArraySchema {
+            fields: vec![field("item", "the item name"), field("price", "unit price")],
+            description: None,
+            has_nested_groups: false,
+        };
+        let grid = TableGrid {
+            page: 1,
+            header: Some(vec![
+                "Item".to_string(),
+                "Price".to_string(),
+                "Ref".to_string(),
+            ]),
+            rows: vec![
+                row(&["Widget", "$9.00", "A1"], 680.0),
+                // Only the unmapped "Ref" column is filled → all-null record.
+                row(&["", "", "B2"], 660.0),
+            ],
+        };
+        let out = ex.extract_object_array(&group, &[grid]);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("Widget"));
+    }
+
+    /// A body row whose resolved cells only echo their field names / column
+    /// headers is a mis-binned wrapped-header line ("At Closing" under
+    /// `borrower_paid_at_closing`), not data — dropped.
+    #[test]
+    fn object_array_drops_label_echo_rows() {
+        let ex = LocalExtractor::from_units(OffsetMap::default(), vec![]);
+        let group = ObjectArraySchema {
+            fields: vec![
+                field("borrower_paid_at_closing", "amount the borrower paid"),
+                field("paid_by_others", "amount paid by third parties"),
+            ],
+            description: None,
+            has_nested_groups: false,
+        };
+        let grid = TableGrid {
+            page: 1,
+            header: Some(vec!["Borrower-Paid".to_string(), "Paid by".to_string()]),
+            rows: vec![
+                // The split sub-header line detection binned as a body row.
+                row(&["At Closing", "Others"], 700.0),
+                row(&["$405.00", ""], 680.0),
+            ],
+        };
+        let out = ex.extract_object_array(&group, &[grid]);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("$405.00"));
+    }
+
+    /// Array signal: a lone sparse record must not read `strong` (the v13
+    /// over-promise); a dense record with a value-shaped cell must.
+    #[test]
+    fn array_signal_requires_density_and_shape() {
+        let strong_field = |name: &str, value: &str, signal: Signal, typed: bool| FieldResult {
+            name: name.into(),
+            value: Some(value.into()),
+            signal,
+            score: Some(1.0),
+            page: Some(1),
+            bbox: None,
+            candidates: vec![Candidate {
+                value: value.into(),
+                text: value.into(),
+                score: 1.0,
+                page: 1,
+                bbox: None,
+                source: UnitSource::HeaderCell,
+                typed_match: typed,
+            }],
+        };
+        // One of two sub-fields resolved, raw span: weak, not strong.
+        let sparse = Record {
+            fields: vec![
+                strong_field("a", "junk", Signal::Weak, false),
+                FieldResult::miss("b"),
+            ],
+        };
+        assert_eq!(
+            ArrayFieldResult::new("g".into(), vec![sparse.clone()]).signal,
+            Signal::Weak
+        );
+        // Both resolved, one value-shaped: strong.
+        let dense = Record {
+            fields: vec![
+                strong_field("a", "Bolt", Signal::Weak, false),
+                strong_field("b", "$9.00", Signal::Strong, true),
+            ],
+        };
+        assert_eq!(
+            ArrayFieldResult::new("g".into(), vec![sparse, dense]).signal,
+            Signal::Strong
+        );
+        // No records is an honest none.
+        assert_eq!(
+            ArrayFieldResult::new("g".into(), vec![]).signal,
+            Signal::None
+        );
+    }
+
+    /// An implemented `format` scanner that matches nowhere never guesses: the
+    /// value is null, signal `none`, while the retrieved spans stay available.
+    #[test]
+    fn format_no_match_yields_null_not_raw_span() {
+        let ex = extractor(&["Contact our sales team for email support today"]);
+        let mut f = field("contact_email", "contact email support team");
+        f.format = Some("email".into());
+        let out = ex.extract_field(&f);
+        assert_eq!(out.value, None);
+        assert_eq!(out.signal, Signal::None);
+        assert!(!out.candidates.is_empty(), "spans stay for provenance");
+
+        // An unimplemented format keyword imposes no such claim — raw-span
+        // fallback stands.
+        let mut g = field("contact_phone", "contact email support team");
+        g.format = Some("phone".into());
+        let out = ex.extract_field(&g);
+        assert!(out.value.is_some());
+        assert_eq!(out.signal, Signal::Weak);
+    }
+
+    /// Without an embedder every candidate is lexically anchored by
+    /// construction — plain BM25 retrieval keeps its `weak` tier. (The
+    /// embed-only noise degrade is exercised e2e; it needs a model.)
+    #[test]
+    fn bm25_candidates_stay_lexically_anchored() {
+        let ex = extractor(&["Payment terms net 30"]);
+        let out = ex.extract_field(&field("terms", "payment terms"));
+        assert_eq!(out.signal, Signal::Weak);
+        assert!(out.value.is_some());
+    }
+
+    /// The typed-hit anchor gate is inert without an embedder: anchored typed
+    /// hits keep `strong` regardless of their (squashed-BM25) score. The
+    /// demotion side — an unanchored typed hit below the cosine floor reading
+    /// `none` — is fused-mode-only and exercised e2e (it needs a model).
+    #[test]
+    fn anchored_typed_hit_stays_strong() {
+        let ex = extractor(&["Total due $118.50 today"]);
+        let mut f = field("total_amount", "total amount due");
+        f.field_type = FieldType::Number;
+        let out = ex.extract_field(&f);
+        assert_eq!(out.signal, Signal::Strong);
+        assert_eq!(out.value.as_deref(), Some("$118.50"));
     }
 }

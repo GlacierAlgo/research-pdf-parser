@@ -28,10 +28,32 @@ pub(super) fn typed_value(field: &SchemaField, text: &str) -> Option<String> {
     match field.field_type {
         FieldType::Date => find_date(text),
         FieldType::Int => find_integer(text),
-        FieldType::Number => find_number(text),
+        FieldType::Number => {
+            if money_hint(&field.name) && super::gate_enabled("LITEPARSE_EXTRACT_MONEY_SHAPE_GATE")
+            {
+                find_money(text)
+            } else {
+                find_number(text)
+            }
+        }
         FieldType::Bool => find_bool(text),
         FieldType::Str | FieldType::List | FieldType::Other => None,
     }
+}
+
+/// Does the field's name say the number is an amount of *money* (price, fee,
+/// total, pay, …)? Word-boundaried on the retrieval tokenizer, like
+/// `schema_json::name_hints`. Count-ish numeric hints (qty, count, rate) are
+/// deliberately absent — their values are legitimately bare digit runs, which
+/// the money shape gate would reject.
+fn money_hint(name: &str) -> bool {
+    const MONEY: &[&str] = &[
+        "amount", "total", "subtotal", "price", "cost", "fee", "balance", "tax", "discount",
+        "shipping", "paid", "pay", "salary", "wage", "charge", "charged", "due",
+    ];
+    super::tokenize(name)
+        .iter()
+        .any(|t| MONEY.contains(&t.as_str()))
 }
 
 /// The value used when no typed scanner fired: the span trimmed of a clean
@@ -130,6 +152,19 @@ fn find_integer(text: &str) -> Option<String> {
 /// `"Total $146,688.00 due"` → `"$146,688.00"`. Digit runs embedded in a larger
 /// token (invoice ids, date fragments) are skipped — see [`standalone`].
 fn find_number(text: &str) -> Option<String> {
+    scan_number(text, false)
+}
+
+/// [`find_number`] restricted to *money-shaped* runs, for money-hinted fields:
+/// a run qualifies only with a currency symbol, a decimal point, or a
+/// thousands comma, and percent runs (`"11.4 %"`) are skipped. Bare digit runs
+/// — street numbers, phone fragments, OCR noise — never promote; the scan
+/// walks on to the next run, so `"Price: 11.4 % $ 12.8"` yields `"$ 12.8"`.
+fn find_money(text: &str) -> Option<String> {
+    scan_number(text, true)
+}
+
+fn scan_number(text: &str, money_only: bool) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut from = 0;
@@ -137,9 +172,13 @@ fn find_number(text: &str) -> Option<String> {
         // Forward extent from the first digit.
         let mut end = first;
         let mut seen_dot = false;
+        let mut seen_comma = false;
         while end < n {
             let c = chars[end];
-            if c.is_ascii_digit() || (c == ',' && next_is_digit(&chars, end)) {
+            if c.is_ascii_digit() {
+                end += 1;
+            } else if c == ',' && next_is_digit(&chars, end) {
+                seen_comma = true;
                 end += 1;
             } else if c == '.' && !seen_dot && next_is_digit(&chars, end) {
                 seen_dot = true;
@@ -157,7 +196,17 @@ fn find_number(text: &str) -> Option<String> {
             } else if start > 0 && is_currency(chars[start - 1]) {
                 start -= 1;
             }
-            return Some(chars[start..end].iter().collect::<String>());
+            let money_shaped = start < first || seen_dot || seen_comma;
+            let percent = {
+                let mut k = end;
+                if chars.get(k) == Some(&' ') {
+                    k += 1;
+                }
+                chars.get(k) == Some(&'%')
+            };
+            if !money_only || (money_shaped && !percent) {
+                return Some(chars[start..end].iter().collect::<String>());
+            }
         }
         from = end;
     }
@@ -228,6 +277,17 @@ fn match_format(fmt: &str, text: &str) -> Option<String> {
         "date" | "date-time" => find_date(text),
         _ => None,
     }
+}
+
+/// Does `fmt` select a scanner this engine actually implements? Distinguishes
+/// "the scanner looked and found nothing" (never guess — the field goes null,
+/// like an enum with no matching choice) from "we don't understand this format
+/// keyword" (no scanner ever ran, so the raw-span fallback stands).
+pub(super) fn has_format_scanner(fmt: &str) -> bool {
+    matches!(
+        fmt.to_ascii_lowercase().as_str(),
+        "email" | "idn-email" | "uri" | "url" | "iri" | "date" | "date-time"
+    )
 }
 
 /// First whitespace-delimited token that looks like an email address. Trims
@@ -491,6 +551,46 @@ mod tests {
         assert_eq!(find_integer("ref A-1, qty 12"), Some("12".into()));
         // Standalone negatives keep working (sign not captured, as before).
         assert_eq!(find_number("delta -42.5 today"), Some("42.5".into()));
+    }
+
+    #[test]
+    fn money_hinted_fields_require_money_shape() {
+        let money = |name: &str| SchemaField {
+            name: name.into(),
+            ..field(FieldType::Number)
+        };
+        // Bare digit runs never promote for a money-hinted field (the dogfood
+        // fabrications: street number, garbled OCR phone fragment).
+        assert_eq!(typed_value(&money("total_charged"), "123 Lane, eld"), None);
+        assert_eq!(
+            typed_value(&money("price_or_fee"), "Panes 55 173-567"),
+            None
+        );
+        // Currency / decimal / thousands-comma shapes all qualify.
+        assert_eq!(
+            typed_value(&money("standard_build_price"), "Standard - Price: $146,688"),
+            Some("$146,688".into())
+        );
+        assert_eq!(
+            typed_value(&money("total_gross"), "Total gross payroll 30,600 due"),
+            Some("30,600".into())
+        );
+        assert_eq!(
+            typed_value(&money("late_fee"), "late fee of 2.50"),
+            Some("2.50".into())
+        );
+        // A percent run is skipped in favor of the money-shaped run after it.
+        assert_eq!(
+            typed_value(&money("share_price"), "Price: 11.4 % $ 12.8"),
+            Some("$ 12.8".into())
+        );
+        // Percent-only span → no money value at all.
+        assert_eq!(typed_value(&money("total_cost"), "up 11.4 % overall"), None);
+        // Non-money number fields keep the permissive scanner (name "f").
+        assert_eq!(
+            typed_value(&field(FieldType::Number), "population 338"),
+            Some("338".into())
+        );
     }
 
     #[test]

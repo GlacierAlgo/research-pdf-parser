@@ -311,6 +311,7 @@ impl LiteParse {
                 let group = ObjectArraySchema {
                     fields: oa.fields.iter().map(|f| f.to_schema_field()).collect(),
                     description: None,
+                    has_nested_groups: oa.has_nested_groups,
                 };
                 let mut records = extractor.extract_object_array(&group, &grids).records;
                 for rec in &mut records {
