@@ -23,6 +23,12 @@
 //!   adaptive gate, no IDF, no threshold — Phase 0 measured the gate
 //!   Pareto-dominated). `Bm25`/`Embed` stay selectable; pure `Embed` is the
 //!   right mode for known-paraphrastic corpus routing.
+//! - **MaxSim late interaction (experimental, gated — EXTRACT_PLAN "R0").**
+//!   `LITEPARSE_EXTRACT_MAXSIM=1` builds a per-token index and folds a third
+//!   ColBERT-style signal into `Auto` (query-token↔unit-token before pooling),
+//!   also enabling [`FusionMode::Maxsim`]. No new model — it reuses the static
+//!   token table — targeting the paraphrase regime where pooled cosine is weak.
+//!   Off by default (per-token vectors cost memory); A/B via `eval_extract`.
 //!
 //! ## What is deliberately NOT here yet
 //!
@@ -427,6 +433,13 @@ pub enum FusionMode {
     /// Embedding only — the mode for known-paraphrastic corpus routing.
     /// Degrades to BM25 when no embedder is attached.
     Embed,
+    /// **Experimental (EXTRACT_PLAN "R0").** Late-interaction (MaxSim) over the
+    /// static *token* vectors alone — the paraphrase-regime probe: does scoring
+    /// query-token↔unit-token before any pooling beat the pooled cosine that
+    /// [`Embed`](FusionMode::Embed) uses? Requires the per-token index, built
+    /// only when `LITEPARSE_EXTRACT_MAXSIM=1` at embedder-attach time; degrades
+    /// to BM25 without it (or with no embedder). Not exposed on the CLI.
+    Maxsim,
 }
 
 /// RRF constant, matching the Python reference (`crux.py` `RRF_K`).
@@ -461,7 +474,7 @@ const TYPED_UNANCHORED_COSINE_FLOOR: f32 = 0.25;
 /// reference argsorts a dense score vector, so every unit always has a
 /// position there; index order is our deterministic stand-in for its
 /// arbitrary zero-score tie order.
-fn rrf_fuse(rankings: [&[(usize, f32)]; 2], n: usize) -> Vec<(usize, f32)> {
+fn rrf_fuse(rankings: &[&[(usize, f32)]], n: usize) -> Vec<(usize, f32)> {
     let mut fused = vec![0.0f32; n];
     for ranking in rankings {
         let mut pos = vec![usize::MAX; n];
@@ -494,6 +507,9 @@ struct EmbedIndex {
     /// so dot product = cosine).
     vecs: Vec<f32>,
     dim: usize,
+    /// Per-token index for MaxSim late interaction — `Some` only when the R0
+    /// gate (`LITEPARSE_EXTRACT_MAXSIM=1`) is set at attach time.
+    tok: Option<TokenIndex>,
 }
 
 #[cfg(feature = "static-embed")]
@@ -507,6 +523,71 @@ impl EmbedIndex {
                 let row = &self.vecs[i * self.dim..(i + 1) * self.dim];
                 let dot = row.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>();
                 (i, dot)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored
+    }
+}
+
+/// R0 MaxSim A/B gate. Off by default; `LITEPARSE_EXTRACT_MAXSIM=1` builds the
+/// per-token index in [`with_embedder`](LocalExtractor::with_embedder), which
+/// then (a) turns [`FusionMode::Auto`] into a *three-way* fuse (BM25 ∪ pooled
+/// cosine ∪ MaxSim) and (b) enables [`FusionMode::Maxsim`]. See EXTRACT_PLAN
+/// "R0" for the rationale (recover part of ColBERT's paraphrase strength with no
+/// new model, using the token vectors already in the lookup table).
+#[cfg(feature = "static-embed")]
+fn maxsim_enabled() -> bool {
+    matches!(
+        std::env::var("LITEPARSE_EXTRACT_MAXSIM").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Per-unit token vectors for MaxSim (ColBERT-style late interaction) over the
+/// static token table. `tok[i]` is unit `i`'s flat row-major `[n_i × dim]`
+/// matrix, each token L2-normalized by [`StaticEmbedder::embed_tokens`] (so a
+/// dot product is a cosine). This is the memory cost R0 gates behind a flag: it
+/// holds *every* token's vector, not one pooled vector per unit.
+#[cfg(feature = "static-embed")]
+struct TokenIndex {
+    tok: Vec<Vec<f32>>,
+    dim: usize,
+}
+
+#[cfg(feature = "static-embed")]
+impl TokenIndex {
+    /// MaxSim ranking: `score(unit) = Σ_q max_d cos(q, d)` — for each query
+    /// token, its best-matching unit token, summed. This is exactly ColBERT's
+    /// scoring, but over non-contextual static vectors, which is the whole point
+    /// of R0: measure how much of the paraphrase gap is *pooling* throwing away
+    /// token-level matches vs. the token vectors themselves being flat. The per-
+    /// query-token max floors at 0 (a query token with no positive match — and
+    /// an empty unit — contributes nothing), keeping the score monotonic in
+    /// matches. `q_tok` is the flat query-token buffer from `embed_tokens`.
+    fn rank(&self, q_tok: &[f32]) -> Vec<(usize, f32)> {
+        let d = self.dim.max(1);
+        let m = q_tok.len() / d;
+        let mut scored: Vec<(usize, f32)> = self
+            .tok
+            .iter()
+            .enumerate()
+            .map(|(i, unit)| {
+                let n_dtok = unit.len() / d;
+                let mut sum = 0.0f32;
+                for qi in 0..m {
+                    let qv = &q_tok[qi * d..(qi + 1) * d];
+                    let mut best = 0.0f32;
+                    for dj in 0..n_dtok {
+                        let dv = &unit[dj * d..(dj + 1) * d];
+                        let dot = qv.iter().zip(dv).map(|(a, b)| a * b).sum::<f32>();
+                        if dot > best {
+                            best = dot;
+                        }
+                    }
+                    sum += best;
+                }
+                (i, sum)
             })
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -588,10 +669,22 @@ impl LocalExtractor {
         for unit in &self.units {
             vecs.extend(embedder.embed(&unit.text));
         }
+        // R0 (gated): also build the per-token index for MaxSim. Off by default
+        // — it holds every token's vector, not one pooled vector per unit — so
+        // only the A/B pays the memory (≈ tokens×dim×4 B per unit).
+        let tok = maxsim_enabled().then(|| TokenIndex {
+            tok: self
+                .units
+                .iter()
+                .map(|u| embedder.embed_tokens_mixed(&u.text))
+                .collect(),
+            dim,
+        });
         self.embed = Some(EmbedIndex {
             embedder,
             vecs,
             dim,
+            tok,
         });
         self
     }
@@ -623,10 +716,23 @@ impl LocalExtractor {
             match fusion {
                 FusionMode::Bm25 => {}
                 FusionMode::Embed => return embed.rank(query),
+                FusionMode::Maxsim => {
+                    // R0 late-interaction alone. Falls through to BM25 when the
+                    // gate never built the token index.
+                    if let Some(tok) = &embed.tok {
+                        return tok.rank(&embed.embedder.embed_tokens_mixed(query));
+                    }
+                }
                 FusionMode::Auto => {
                     let bm25 = self.index.score(query);
                     let cos = embed.rank(query);
-                    return rrf_fuse([&bm25, &cos], self.units.len());
+                    // R0 gate on → three-way fuse (BM25 ∪ cosine ∪ MaxSim); off
+                    // → the frozen two-way always-fuse.
+                    if let Some(tok) = &embed.tok {
+                        let mx = tok.rank(&embed.embedder.embed_tokens_mixed(query));
+                        return rrf_fuse(&[&bm25, &cos, &mx], self.units.len());
+                    }
+                    return rrf_fuse(&[&bm25, &cos], self.units.len());
                 }
             }
         }
@@ -1319,7 +1425,7 @@ mod tests {
         // positions 1,2 in index order. embed is dense: doc 1, 0, 2.
         let bm25 = vec![(2usize, 5.0f32)];
         let embed = vec![(1usize, 0.9f32), (0, 0.5), (2, 0.1)];
-        let fused = rrf_fuse([&bm25, &embed], 3);
+        let fused = rrf_fuse(&[&bm25, &embed], 3);
         // doc1 = 1/62 + 1/60, doc2 = 1/60 + 1/62 — an exact tie, broken by
         // lower index; doc0 = 1/61 + 1/61 loses to both.
         let order: Vec<usize> = fused.iter().map(|(d, _)| *d).collect();
@@ -1339,6 +1445,29 @@ mod tests {
             ex.rank_with(q, FusionMode::Embed),
             ex.rank_with(q, FusionMode::Bm25)
         );
+    }
+
+    #[cfg(feature = "static-embed")]
+    #[test]
+    fn maxsim_scores_best_per_query_token_and_floors_at_zero() {
+        // dim=2, unit token vectors already L2-normalized. unit0 = one "east"
+        // token (1,0); unit1 = two "north" tokens (0,1); unit2 has no tokens.
+        let idx = TokenIndex {
+            tok: vec![vec![1.0, 0.0], vec![0.0, 1.0, 0.0, 1.0], vec![]],
+            dim: 2,
+        };
+        // Query token points mostly east → highest max-cos against unit0.
+        let ranked = idx.rank(&[0.98, 0.20]);
+        assert_eq!(ranked[0].0, 0, "east query ranks the east unit first");
+        assert!(ranked[0].1 > ranked[1].1);
+        // The empty unit contributes nothing and sorts last at score 0.
+        let (empty_i, empty_s) = *ranked.last().unwrap();
+        assert_eq!(empty_i, 2);
+        assert_eq!(empty_s, 0.0);
+        // A query token anti-correlated with every unit token floors at 0, not
+        // a negative contribution (west vs an all-east/north index).
+        let ranked_west = idx.rank(&[-1.0, 0.0]);
+        assert!(ranked_west.iter().all(|(_, s)| *s == 0.0));
     }
 
     #[test]
