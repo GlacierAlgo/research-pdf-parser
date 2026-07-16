@@ -128,176 +128,6 @@ pub struct StaticEmbedder {
     /// Pre-tokenize char cap: `MAX_TOKENS × median vocab-token char length`.
     char_cap: usize,
     normalize: bool,
-    /// Optional R2 contextualizing head. `Some` when `mixer.safetensors` sits
-    /// in the model dir and `LITEPARSE_EXTRACT_MIXER != 0` — then
-    /// [`embed_tokens_mixed`](Self::embed_tokens_mixed) sharpens each token
-    /// vector before MaxSim. Absent → the raw-R0 static token vectors.
-    mixer: Option<MixerHead>,
-}
-
-/// R2 mixer gate (companion to `LITEPARSE_EXTRACT_MAXSIM`). The mixer loads by
-/// default whenever `mixer.safetensors` is present beside the model;
-/// `LITEPARSE_EXTRACT_MIXER=0` forces the raw-R0 token vectors — the control
-/// arm of the Phase 6 A/B.
-fn mixer_disabled() -> bool {
-    matches!(
-        std::env::var("LITEPARSE_EXTRACT_MIXER").as_deref(),
-        Ok("0") | Ok("false")
-    )
-}
-
-/// The R2 contextualizing conv block (`tokenlearn/mixer.py`), sharpening potion
-/// static token directions toward contextual teacher directions before MaxSim.
-/// A hand-port of the ~530k-param forward: zero-padded depthwise conv over the
-/// token axis → cross-channel pointwise linear → optional sigmoid GLU gate from
-/// the raw input → residual → per-token L2. Everything is fp32 in
-/// L2-normalized cosine space (R2_PLAN discovery (B)); the input is exactly
-/// [`StaticEmbedder::embed_tokens`]'s per-token normalized rows.
-struct MixerHead {
-    dim: usize,
-    kernel: usize,
-    /// Depthwise conv weights, row-major `[dim × kernel]` (torch Conv1d
-    /// `(dim, 1, kernel)`; element `[c, 0, j]` at `c*kernel + j`).
-    dw_weight: Vec<f32>,
-    dw_bias: Vec<f32>,
-    /// Pointwise linear, row-major `[out × in] = [dim × dim]` (torch Linear
-    /// `(out, in)`; `[o, i]` at `o*dim + i`).
-    pw_weight: Vec<f32>,
-    pw_bias: Vec<f32>,
-    /// GLU gate `(weight [dim×dim], bias [dim])`; `None` when trained gate-less.
-    gate: Option<(Vec<f32>, Vec<f32>)>,
-}
-
-impl MixerHead {
-    /// Load from `dir/mixer.safetensors` + `dir/mixer_config.json`. `Ok(None)`
-    /// when no mixer file is present (the raw-R0 path); `Err` when a mixer file
-    /// is present but malformed (wrong dtype/shape, unreadable config).
-    fn load(dir: &Path) -> Result<Option<MixerHead>, LiteParseError> {
-        let st_path = dir.join("mixer.safetensors");
-        if !st_path.is_file() {
-            return Ok(None);
-        }
-
-        #[derive(serde::Deserialize)]
-        struct MixerConfig {
-            dim: usize,
-            kernel: usize,
-            gate: bool,
-        }
-        let cfg_raw = std::fs::read(dir.join("mixer_config.json"))?;
-        let cfg: MixerConfig = serde_json::from_slice(&cfg_raw)?;
-        if cfg.kernel % 2 == 0 {
-            return Err(extract_err("mixer config", "kernel must be odd"));
-        }
-
-        let raw = std::fs::read(&st_path)?;
-        let st = safetensors::SafeTensors::deserialize(&raw)
-            .map_err(|e| extract_err("mixer safetensors", e))?;
-        // Decode one F32 tensor of exactly `len` elements into an owned Vec.
-        // The head is ~2 MB, so we read it once rather than mmap-and-decode per
-        // GEMV element — the whole matrix is touched every forward anyway.
-        let get = |name: &str, len: usize| -> Result<Vec<f32>, LiteParseError> {
-            let stage = format!("mixer[{name}]");
-            let view = st.tensor(name).map_err(|e| extract_err(&stage, e))?;
-            if view.dtype() != safetensors::Dtype::F32 {
-                return Err(extract_err(
-                    &stage,
-                    format!("expected F32, got {:?}", view.dtype()),
-                ));
-            }
-            let data = view.data();
-            if data.len() != len * 4 {
-                return Err(extract_err(
-                    &stage,
-                    format!("expected {len} f32, got {}", data.len() / 4),
-                ));
-            }
-            Ok(data
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect())
-        };
-
-        let (dim, k) = (cfg.dim, cfg.kernel);
-        let gate = if cfg.gate {
-            Some((get("gate.weight", dim * dim)?, get("gate.bias", dim)?))
-        } else {
-            None
-        };
-        Ok(Some(MixerHead {
-            dim,
-            kernel: k,
-            dw_weight: get("dwconv.weight", dim * k)?,
-            dw_bias: get("dwconv.bias", dim)?,
-            pw_weight: get("pointwise.weight", dim * dim)?,
-            pw_bias: get("pointwise.bias", dim)?,
-            gate,
-        }))
-    }
-
-    /// Apply the block to per-token L2-normalized rows `e` (flat `[n × dim]`),
-    /// returning re-normalized flat `[n × dim]`. Mirrors `mixer.py::Mixer.forward`
-    /// 1:1: torch Conv1d is cross-correlation (no kernel flip), so the conv reads
-    /// input index `t + j − kernel/2` with zeros past the line ends ("same" zero
-    /// padding — the true per-line boundaries, matching how the mixer was
-    /// trained). GEMVs accumulate in f32 to track torch's fp32 matmul.
-    fn apply(&self, e: &[f32]) -> Vec<f32> {
-        let dim = self.dim;
-        let k = self.kernel;
-        let pad = (k / 2) as isize;
-        let n = e.len() / dim;
-        let mut out = vec![0.0f32; n * dim];
-        let mut h = vec![0.0f32; dim]; // depthwise-conv output, reused per token
-        let mut p = vec![0.0f32; dim]; // pointwise output, reused per token
-        for t in 0..n {
-            // Depthwise conv over the token axis (per channel), zero-padded.
-            for c in 0..dim {
-                let wrow = &self.dw_weight[c * k..(c + 1) * k];
-                let mut acc = self.dw_bias[c];
-                for (j, &w) in wrow.iter().enumerate() {
-                    let src = t as isize + j as isize - pad;
-                    if src >= 0 && (src as usize) < n {
-                        acc += w * e[src as usize * dim + c];
-                    }
-                }
-                h[c] = acc;
-            }
-            // Cross-channel pointwise mixing (the composition capacity).
-            for o in 0..dim {
-                let wrow = &self.pw_weight[o * dim..(o + 1) * dim];
-                let mut acc = self.pw_bias[o];
-                for (i, &w) in wrow.iter().enumerate() {
-                    acc += w * h[i];
-                }
-                p[o] = acc;
-            }
-            let erow = &e[t * dim..(t + 1) * dim];
-            // Optional GLU gate, conditioned on the raw input row.
-            if let Some((gw, gb)) = &self.gate {
-                for o in 0..dim {
-                    let wrow = &gw[o * dim..(o + 1) * dim];
-                    let mut acc = gb[o];
-                    for (i, &w) in wrow.iter().enumerate() {
-                        acc += w * erow[i];
-                    }
-                    p[o] *= 1.0 / (1.0 + (-acc).exp());
-                }
-            }
-            // Residual + re-normalize back to cosine space for MaxSim.
-            let orow = &mut out[t * dim..(t + 1) * dim];
-            let mut norm = 0.0f32;
-            for o in 0..dim {
-                let v = erow[o] + p[o];
-                orow[o] = v;
-                norm += v * v;
-            }
-            let norm = norm.sqrt().max(1e-12); // torch F.normalize's eps clamp
-            for v in orow.iter_mut() {
-                *v /= norm;
-            }
-        }
-        out
-    }
 }
 
 fn extract_err(stage: &str, e: impl std::fmt::Display) -> LiteParseError {
@@ -409,13 +239,6 @@ impl StaticEmbedder {
             ),
             EmbedPrecision::Int8 => quantize_int8_bytes(tensor_bytes),
         };
-        // R2: pick up a contextualizing mixer head if one is bundled beside the
-        // model, unless the A/B control env forces the raw-R0 vectors.
-        let mixer = if mixer_disabled() {
-            None
-        } else {
-            MixerHead::load(dir)?
-        };
 
         Ok(StaticEmbedder {
             tokenizer,
@@ -424,7 +247,6 @@ impl StaticEmbedder {
             unk_id,
             char_cap,
             normalize: config.normalize,
-            mixer,
         })
     }
 
@@ -433,9 +255,9 @@ impl StaticEmbedder {
         self.dim
     }
 
-    /// Tokenize `text` the model2vec way, shared by [`embed`](Self::embed) and
-    /// [`embed_tokens`](Self::embed_tokens): char-truncate first (cheap), encode
-    /// with `add_special_tokens=false`, strip `[UNK]` ids, cap at [`MAX_TOKENS`].
+    /// Tokenize `text` the model2vec way for [`embed`](Self::embed):
+    /// char-truncate first (cheap), encode with `add_special_tokens=false`,
+    /// strip `[UNK]` ids, cap at [`MAX_TOKENS`].
     /// Tokenizer errors are unreachable for plain strings on a validated
     /// tokenizer; treat them as "no tokens" rather than plumbing a `Result` into
     /// every ranking loop.
@@ -478,57 +300,6 @@ impl StaticEmbedder {
             }
         }
         acc.into_iter().map(|v| v as f32).collect()
-    }
-
-    /// Per-token, individually L2-normalized embedding rows for `text`, as a
-    /// flat row-major `[n_tokens × dim]` buffer (so `n_tokens = out.len() /
-    /// dim()`). Same tokenization + `[UNK]` filtering as [`embed`](Self::embed)
-    /// but WITHOUT mean-pooling: each token keeps its own vector.
-    ///
-    /// This is the primitive behind MaxSim late interaction (EXTRACT_PLAN "R0"):
-    /// pooling into one vector per line is exactly what collapses "due date" and
-    /// "invoice date" toward a shared centroid, so the late-interaction channel
-    /// scores query tokens against unit tokens *before* any pooling. Each row is
-    /// L2-normalized here regardless of the model's `normalize` config, because
-    /// MaxSim needs unit vectors for a dot product to equal a cosine. An input
-    /// with no usable tokens returns an empty vec (contributes nothing to a
-    /// MaxSim sum).
-    pub fn embed_tokens(&self, text: &str) -> Vec<f32> {
-        self.normalized_token_rows(text)
-    }
-
-    /// The shared body of [`embed_tokens`](Self::embed_tokens) and
-    /// [`embed_tokens_mixed`](Self::embed_tokens_mixed): the flat row-major
-    /// `[n_tokens × dim]` buffer of per-token L2-normalized potion rows.
-    fn normalized_token_rows(&self, text: &str) -> Vec<f32> {
-        let ids = self.token_ids(text);
-        let mut out = Vec::with_capacity(ids.len() * self.dim);
-        for id in &ids {
-            let mut acc = vec![0.0f64; self.dim];
-            self.matrix.accumulate_row(*id as usize, self.dim, &mut acc);
-            let norm = acc.iter().map(|v| v * v).sum::<f64>().sqrt() + NORM_EPS;
-            out.extend(acc.into_iter().map(|v| (v / norm) as f32));
-        }
-        out
-    }
-
-    /// Like [`embed_tokens`](Self::embed_tokens), but when an R2 [`MixerHead`] is
-    /// loaded, sharpen each token vector through it (contextualized MaxSim). With
-    /// no mixer present this is byte-identical to `embed_tokens` — the raw-R0
-    /// path — so the MaxSim callers use it unconditionally and the presence of
-    /// `mixer.safetensors` (gated by `LITEPARSE_EXTRACT_MIXER`) decides which
-    /// vectors the token index and query share.
-    pub fn embed_tokens_mixed(&self, text: &str) -> Vec<f32> {
-        let e = self.normalized_token_rows(text);
-        match &self.mixer {
-            Some(m) if !e.is_empty() => m.apply(&e),
-            _ => e,
-        }
-    }
-
-    /// Whether an R2 contextualizing mixer head is loaded (raw-R0 when false).
-    pub fn has_mixer(&self) -> bool {
-        self.mixer.is_some()
     }
 }
 
@@ -774,74 +545,6 @@ mod tests {
         }
         eprintln!(
             "int8 parity: {} cases, worst max-abs diff {worst:.2e}",
-            fixture.cases.len()
-        );
-    }
-
-    // ── R2 mixer parity (Phase 5) ──────────────────────────────────────────
-
-    const MIXER_FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../dataset_eval_utils/extract_poc/mixer_fixture.json"
-    );
-
-    #[derive(serde::Deserialize)]
-    struct MixerFixture {
-        dim: usize,
-        cases: Vec<MixerCase>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct MixerCase {
-        text: String,
-        token_ids: Vec<u32>,
-        mixer_output_fp32: Vec<f32>,
-    }
-
-    #[test]
-    fn parity_mixer_outputs() {
-        // The mixer artifacts (mixer.safetensors + mixer_config.json) and the
-        // goldens live together in extract_poc/. Only a locally-absent MODEL
-        // downgrades to skip; a missing checked-in mixer file is a real failure.
-        let Some((_, model_dir)) = load_fixture_and_model() else {
-            return;
-        };
-        let poc_dir = Path::new(MIXER_FIXTURE).parent().unwrap();
-        let fixture: MixerFixture = serde_json::from_str(
-            &std::fs::read_to_string(MIXER_FIXTURE).expect("read mixer_fixture.json"),
-        )
-        .expect("parse mixer_fixture.json");
-
-        let mut emb = StaticEmbedder::load(&model_dir).expect("load fp32 model");
-        assert_eq!(emb.dim(), fixture.dim);
-        // Attach the mixer straight from the fixture dir (runtime loads it from
-        // the model dir; the HF cache snapshot has no mixer bundled).
-        emb.mixer = MixerHead::load(poc_dir).expect("load mixer head");
-        assert!(emb.has_mixer(), "mixer.safetensors missing beside goldens");
-
-        let mut worst = 0.0f32;
-        for case in &fixture.cases {
-            // Localize a mismatch: the tokenizer stage first, then the forward.
-            let ids = emb.token_ids(&case.text);
-            assert_eq!(ids, case.token_ids, "token ids diverge on {:?}", case.text);
-
-            let got = emb.embed_tokens_mixed(&case.text);
-            assert_eq!(
-                got.len(),
-                case.mixer_output_fp32.len(),
-                "mixer output length diverges on {:?}",
-                case.text
-            );
-            let diff = max_abs_diff(&got, &case.mixer_output_fp32);
-            worst = worst.max(diff);
-            assert!(
-                diff < 1e-4,
-                "mixer output diverges on {:?}: max abs diff {diff}",
-                case.text
-            );
-        }
-        eprintln!(
-            "mixer parity: {} cases, worst max-abs diff {worst:.2e}",
             fixture.cases.len()
         );
     }
