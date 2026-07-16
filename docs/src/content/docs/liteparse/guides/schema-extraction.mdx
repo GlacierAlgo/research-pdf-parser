@@ -1,0 +1,185 @@
+---
+title: Schema Extraction
+description: Pull specific fields out of a document from a JSON Schema — candidate values with scores, pages, and bounding boxes, fully local and with no LLM.
+sidebar:
+  order: 5
+---
+
+`lit extract` pulls specific fields out of a document given a JSON Schema. For each
+field it returns candidate spans with a relevance **score**, a **page**, and a
+**bounding box**, plus a coarse **trust signal** — a *narrowing signal with
+provenance*, not an LLM-grade single answer. It runs entirely locally, with no API
+keys and no LLM.
+
+## What it's good for
+
+- **Locate fields for a downstream model.** Instead of stuffing a whole document into
+  an LLM, extract narrows each field to a handful of scored, page-and-bbox-anchored
+  spans. Feed those to your model (far fewer tokens) or show them to a reviewer.
+- **Zero-LLM extraction for structured documents.** For invoices, forms, and
+  spreadsheets where a value sits next to its label or in a table column, the typed
+  value path returns the answer directly — no model call at all.
+- **Route or gate a corpus.** The score (a cosine similarity when the embedding model
+  is attached) is comparable across documents, so you can keep only the documents that
+  score above a threshold for a given field.
+- **Provenance and citations.** Every candidate carries the page and bounding box of
+  the span it came from, ready to highlight in a viewer (see
+  [Visual Citations](/liteparse/guides/visual-citations/)).
+
+It is **not** a replacement for an LLM on hard, reasoning-heavy extraction. Treat it as
+a fast, local first pass that narrows the search and, for well-structured fields,
+answers outright.
+
+## Quick start
+
+Describe the fields you want with a standard [JSON Schema](https://json-schema.org/).
+Pass it inline (anything starting with `{`) or as a path to a `.json` file:
+
+```bash
+# Inline schema
+lit extract invoice.pdf --schema '{
+  "type": "object",
+  "properties": {
+    "invoice_number": {"type": "string", "description": "the invoice or document number"},
+    "total":          {"type": "number", "description": "grand total amount due"}
+  }
+}'
+
+# Or point --schema at a schema file, write the result to disk
+lit extract invoice.pdf --schema schema.json --output result.json
+```
+
+The `description` of each field is the retrieval query — it's where paraphrase and label
+vocabulary live, so a good description matters more than the field name. `enum` and
+`format` (`email` / `uri` / `date`) sharpen the extracted value.
+
+## The output
+
+Extraction returns one result per field. Each carries a headline answer plus the
+candidate spans behind it:
+
+```json
+{
+  "fields": [
+    {
+      "name": "invoice_number",
+      "value": "INV-2024-0042",
+      "signal": "strong",
+      "score": 0.71,
+      "page": 0,
+      "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
+      "candidates": [
+        {
+          "text": "Invoice Number: INV-2024-0042",
+          "value": "INV-2024-0042",
+          "score": 0.71,
+          "page": 0,
+          "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
+          "source": "natural_line"
+        }
+      ]
+    }
+  ],
+  "arrays": []
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `value` | The extracted answer, or `null` when the engine makes no claim. |
+| `signal` | The trust tier to branch on (see below). |
+| `score` | Relevance of the headline span in `[0, 1]` — embedding cosine, or a squashed keyword score in BM25-only mode. A ranking aid, **not** a probability. |
+| `page` / `bbox` | Where the headline span lives. |
+| `candidates` | Top-k spans, sorted by `score` descending. |
+
+Each **candidate** carries the full span `text` (what you'd highlight), a narrowed
+`value` **only** when a scanner isolated a sub-value out of that span, and a `source`:
+
+- `natural_line` — a projected line of text.
+- `geometry_join` — a label and value assembled from spatially adjacent spans.
+- `header_cell` — a detected table cell (its `bbox` may be `null`).
+
+### Trust signals
+
+Branch on `signal` rather than the raw score:
+
+| Signal | Meaning | What to do |
+|--------|---------|------------|
+| `strong` | A typed scanner isolated the value, with lexical or cosine support. | Act on it. |
+| `weak` | A retrieval match only — no value shape was isolated. | Verify before using. |
+| `none` | No claim. The spans are kept in `candidates` for provenance only. | Escalate or skip. |
+
+The headline is chosen by the value gate, so it is **not** necessarily
+`candidates[0]` — the first candidate is simply the highest-scoring span.
+
+## Nested objects and tables
+
+Nested objects flatten to dotted field names, and an array of objects extracts one
+record per detected table row:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "vendor": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "description": "vendor legal name"},
+        "city": {"type": "string", "description": "vendor city"}
+      }
+    },
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "description": {"type": "string", "description": "line item description"},
+          "amount":      {"type": "number", "description": "line item amount"}
+        }
+      }
+    }
+  }
+}
+```
+
+`vendor.name` and `vendor.city` come back as scalar fields; `line_items` comes back
+under `arrays`, one record per detected table row, each sub-field pulled from the
+column whose header best matches it.
+
+## The model, and running offline
+
+Retrieval fuses a keyword ranker (BM25) with a static embedding model
+(`minishlab/potion-retrieval-32M`, ~250 MB). The model is resolved local-first
+(explicit `--model-path`, `LITEPARSE_EXTRACT_MODEL_PATH`, the Hugging Face cache, or a
+prior download) and **downloaded on first use**, landing in the platform cache
+directory (`LITEPARSE_MODELS_DIR` to override). If the model can't be resolved,
+retrieval degrades cleanly to BM25-only.
+
+```bash
+# Fetch the model ahead of time (e.g. in CI or a Docker build)
+lit models pull
+
+# Never touch the network — use a cached model if present, else BM25-only
+lit extract invoice.pdf --schema schema.json --offline
+```
+
+## CLI options
+
+```
+lit extract [options] <file> --schema <schema>
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--schema <schema>` | JSON Schema — a file path, or inline JSON starting with `{`. **Required.** | — |
+| `-o, --output <path>` | Write the result JSON to a file instead of stdout | — |
+| `--compact` | Compact JSON instead of pretty-printed | — |
+| `--top-k <n>` | Candidate spans returned per field | `5` |
+| `--model <id>` | Static embedding model (Hugging Face id) | `minishlab/potion-retrieval-32M` |
+| `--model-path <dir>` | Explicit local model directory (overrides `--model`) | — |
+| `--offline` | Never download the model; use a cached one if present, else BM25-only | — |
+| `--no-ocr` | Disable OCR | — |
+| `--max-pages <n>` | Maximum pages to parse | `1000` |
+| `--target-pages <pages>` | Pages to parse (e.g. `"1-5,10"`) | — (all) |
+| `--password <password>` | Password for encrypted/protected documents | — |
+| `-q, --quiet` | Suppress progress logging on stderr | — |
