@@ -1,7 +1,7 @@
-//! model2vec static-embedding inference (EXTRACT_PLAN.md, Phase 2).
+//! model2vec static-embedding inference.
 //!
 //! A hand-port of the Python `model2vec.StaticModel.encode` path for the
-//! decided default model (`potion-retrieval-32M`, Phase 0 Result 4): tokenize
+//! default model (`potion-retrieval-32M`): tokenize
 //! with the model's `tokenizer.json`, look up one embedding row per token id,
 //! mean-pool, L2-normalize. There is no ML runtime here — inference is a
 //! matrix row lookup, which is what makes the static engine ~0.05 ms/line.
@@ -21,7 +21,7 @@
 //! 3. When the model config says `normalize: true` (potion models do),
 //!    L2-normalize with model2vec's `+1e-32` denominator guard.
 //!
-//! Parity is enforced against the Phase 0 fixture
+//! Parity is enforced against a reference fixture
 //! (`dataset_eval_utils/extract_poc/parity_fixture.json` — 28 strings with
 //! reference token ids plus fp32 and int8 vectors; see
 //! `export_parity_fixture.py`). The fixture's `token_ids` were exported with
@@ -46,7 +46,7 @@
 //! `model.safetensors` + `config.json`); [`resolve_model_dir`] finds an
 //! already-downloaded copy (explicit path, env var, HF-hub snapshot, or the
 //! liteparse model cache). Download-on-first-use lives in
-//! [`super::model_fetch`] (Phase 4). On native targets the weights are
+//! [`super::model_fetch`]. On native targets the weights are
 //! mmapped, not read: fp32 rows are decoded from the mapping per lookup, so
 //! load cost is ~the tokenizer parse and only touched rows ever page in.
 
@@ -350,6 +350,14 @@ fn quantize_int8_bytes(bytes: &[u8]) -> Matrix {
     Matrix::Int8 { data, scale }
 }
 
+/// A directory holds a usable model2vec model when it contains both a
+/// `tokenizer.json` and a `model.safetensors`. Used to validate an explicit
+/// `--model-path` directly (independent of the resolution fallbacks) and by
+/// [`resolve_model_dir`] for each candidate directory.
+pub fn is_model_dir(dir: &Path) -> bool {
+    dir.join("tokenizer.json").is_file() && dir.join("model.safetensors").is_file()
+}
+
 /// Find a local directory holding the model files, checked in order:
 ///
 /// 1. `explicit` (the `extract_model_path` config),
@@ -361,10 +369,9 @@ fn quantize_int8_bytes(bytes: &[u8]) -> Matrix {
 ///
 /// Returns the first directory that contains both `tokenizer.json` and
 /// `model.safetensors`. On a full miss, native callers download via
-/// `model_fetch::ensure_model` (Phase 4).
+/// [`ensure_model`](super::model_fetch::ensure_model) unless offline.
 pub fn resolve_model_dir(model_id: &str, explicit: Option<&Path>) -> Option<PathBuf> {
-    let has_model =
-        |d: &Path| d.join("tokenizer.json").is_file() && d.join("model.safetensors").is_file();
+    let has_model = is_model_dir;
 
     if let Some(dir) = explicit.filter(|d| has_model(d)) {
         return Some(dir.to_path_buf());
@@ -534,9 +541,9 @@ mod tests {
             let v = emb.embed(&case.text);
             let diff = max_abs_diff(&v, &case.embedding_int8);
             worst = worst.max(diff);
-            // Phase 0 froze ~0.02 as the int8 CI tolerance (fixture drift
-            // median 0.006 / max 0.015 vs fp32; our quantization skips
-            // numpy's float16 intermediate, worth at most 1 int8 step).
+            // ~0.02 is the int8 CI tolerance (fixture drift median 0.006 / max
+            // 0.015 vs fp32; our quantization skips numpy's float16
+            // intermediate, worth at most 1 int8 step).
             assert!(
                 diff < 0.02,
                 "int8 embedding diverges on {:?}: max abs diff {diff}",

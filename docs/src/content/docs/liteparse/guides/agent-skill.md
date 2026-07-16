@@ -2,7 +2,7 @@
 title: Agent Skill
 description: Add LiteParse as a skill for coding agents like Claude Code, Cursor, and others.
 sidebar:
-  order: 7
+  order: 8
 ---
 
 LiteParse can be installed as a **coding agent skill** using Vercel's [skills](https://github.com/vercel-labs/skills) utility. This gives your coding agent the ability to process documents, generate screenshots, and parse text from files, all locally.

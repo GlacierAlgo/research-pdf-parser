@@ -1,5 +1,5 @@
 use crate::error::LiteParseError;
-use crate::extract::{encode_png, load_document_from_input};
+use crate::pdf_read::{encode_png, load_document_from_input};
 use crate::types::PdfInput;
 use pdfium::Library;
 use serde::Serialize;

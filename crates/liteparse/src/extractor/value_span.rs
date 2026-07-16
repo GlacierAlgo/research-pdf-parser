@@ -8,7 +8,7 @@
 //! and slice* the value substring; they don't validate or reformat it.
 //!
 //! No `regex` dependency: the codebase does its text work with char scanning
-//! (see `extract.rs`), and these shapes are simple enough to match by hand. If
+//! (see `pdf_read.rs`), and these shapes are simple enough to match by hand. If
 //! date coverage proves too weak this is the place to swap in `regex`.
 
 use super::{FieldType, SchemaField};
@@ -29,8 +29,7 @@ pub(super) fn typed_value(field: &SchemaField, text: &str) -> Option<String> {
         FieldType::Date => find_date(text),
         FieldType::Int => find_integer(text),
         FieldType::Number => {
-            if money_hint(&field.name) && super::gate_enabled("LITEPARSE_EXTRACT_MONEY_SHAPE_GATE")
-            {
+            if money_hint(&field.name) {
                 find_money(text)
             } else {
                 find_number(text)
@@ -62,6 +61,12 @@ pub(super) fn fallback_value(text: &str) -> String {
     strip_label_prefix(text).to_string()
 }
 
+/// A `Label:` prefix is only stripped when the label side stays under both
+/// limits — a longer, many-word prefix is prose with an incidental colon
+/// (`"Note: the following cases apply, ..."`), not a real label.
+const LABEL_MAX_CHARS: usize = 40;
+const LABEL_MAX_WORDS: usize = 5;
+
 /// `"Invoice Number: INV-42"` → `"INV-42"`. Only strips when the label side is
 /// short and the value side is non-empty, so prose with a mid-sentence colon
 /// (`"Note: the following cases apply, ..."`) isn't truncated to nonsense.
@@ -69,11 +74,9 @@ fn strip_label_prefix(text: &str) -> &str {
     let text = text.trim();
     if let Some((label, rest)) = text.split_once(':') {
         let rest = rest.trim();
-        // A label is short in both chars and words — a long, many-word prefix is
-        // prose with an incidental colon, not "Label: value".
         if !rest.is_empty()
-            && label.chars().count() <= 40
-            && label.split_whitespace().count() <= 5
+            && label.chars().count() <= LABEL_MAX_CHARS
+            && label.split_whitespace().count() <= LABEL_MAX_WORDS
             && !label.contains(". ")
         {
             return rest;
@@ -559,8 +562,8 @@ mod tests {
             name: name.into(),
             ..field(FieldType::Number)
         };
-        // Bare digit runs never promote for a money-hinted field (the dogfood
-        // fabrications: street number, garbled OCR phone fragment).
+        // Bare digit runs never promote for a money-hinted field (e.g. a street
+        // number or a garbled OCR phone fragment).
         assert_eq!(typed_value(&money("total_charged"), "123 Lane, eld"), None);
         assert_eq!(
             typed_value(&money("price_or_fee"), "Panes 55 173-567"),

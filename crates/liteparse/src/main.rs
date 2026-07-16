@@ -1,10 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use liteparse::config::{LiteParseConfig, OutputFormat};
 use liteparse::conversion;
-use liteparse::extract;
-use liteparse::extractor::FusionMode;
 use liteparse::output::{json, text};
 use liteparse::parser::LiteParse;
+use liteparse::pdf_read;
 use liteparse::render;
 use liteparse::types::PdfInput;
 
@@ -34,9 +33,9 @@ enum Commands {
     Extract(ExtractSchemaCommand),
     /// Manage extraction embedding models (pre-fetch with `models pull`)
     Models(ModelsCommand),
-    /// Extract raw text items from a PDF file (no grid projection) [dev tool]
+    /// Dump raw text items from a PDF file (no grid projection) [dev tool]
     #[command(hide = true)]
-    ExtractItems(ExtractCommand),
+    DumpItems(ExtractCommand),
     /// Extract embedded image bounding boxes from a page [dev tool]
     #[command(hide = true)]
     ImageBounds(ExtractCommand),
@@ -52,6 +51,19 @@ struct ExtractSchemaCommand {
     /// Nested objects flatten to dotted field names; array-of-object groups
     /// (e.g. line_items) extract one record per detected table row. Field
     /// `description`s drive retrieval; `enum`/`format` sharpen the value path.
+    ///
+    /// Output: one result per field with `value` (the extracted answer, or null
+    /// on no claim), `signal`, `score`, `page`, `bbox`, and `candidates`.
+    /// `signal` is the trust tier to branch on: `strong` = a typed scanner
+    /// isolated the value with lexical/cosine support; `weak` = a retrieval
+    /// match only, verify before use; `none` = no claim (spans kept for
+    /// provenance only). `candidates` are the top-k spans sorted by `score`
+    /// descending; each carries the full `text` (what to highlight) and, only
+    /// when a scanner isolated a sub-value, a narrowed `value`. The headline is
+    /// chosen by the value gate, so it need not be `candidates[0]`. `source`
+    /// tells you where a span came from: `natural_line` (a projected text line),
+    /// `geometry_join` (label+value assembled from adjacent spans), or
+    /// `header_cell` (a detected table cell; bbox may be null).
     #[arg(long)]
     schema: String,
 
@@ -67,20 +79,22 @@ struct ExtractSchemaCommand {
     #[arg(long, default_value = "5")]
     top_k: usize,
 
-    /// Ranking fusion: "auto" (BM25 + embedding), "bm25" (lexical only — needs
-    /// no model), or "embed" (embedding only, for paraphrastic queries)
-    #[arg(long, default_value = "auto")]
-    fusion: String,
-
     /// Static embedding model (Hugging Face id; local files preferred —
     /// LITEPARSE_EXTRACT_MODEL_PATH, the HF cache, or a prior download —
-    /// else downloaded on first use; pre-fetch with `lit models pull`)
+    /// else downloaded on first use, ~250 MB; pre-fetch with `lit models pull`).
+    /// Retrieval fuses this with BM25, degrading to BM25-only if unavailable.
     #[arg(long, default_value = "minishlab/potion-retrieval-32M")]
     model: String,
 
-    /// Explicit local model directory (overrides --model resolution)
+    /// Explicit local model directory (overrides --model resolution). Errors if
+    /// it doesn't contain a model (tokenizer.json + model.safetensors).
     #[arg(long)]
     model_path: Option<String>,
+
+    /// Never download the model — run offline. A locally cached model is still
+    /// used; if none is found, retrieval degrades to BM25-only (no network).
+    #[arg(long)]
+    offline: bool,
 
     /// Disable OCR
     #[arg(long)]
@@ -99,7 +113,7 @@ struct ExtractSchemaCommand {
     password: Option<String>,
 
     /// Suppress progress logging on stderr
-    #[arg(long)]
+    #[arg(short, long)]
     quiet: bool,
 }
 
@@ -112,8 +126,9 @@ struct ModelsCommand {
 #[derive(Subcommand, Debug)]
 enum ModelsCommands {
     /// Download an extraction embedding model to the liteparse model cache
-    /// (idempotent — resolves existing local copies first). Prints the model
-    /// directory.
+    /// (idempotent — resolves existing local copies first). The default model
+    /// is ~250 MB and lands in the platform cache dir (override with
+    /// LITEPARSE_MODELS_DIR). Prints the model directory.
     Pull(ModelsPullCommand),
 }
 
@@ -587,14 +602,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Extract(cmd) => {
-            let fusion = match cmd.fusion.as_str() {
-                "auto" => FusionMode::Auto,
-                "bm25" => FusionMode::Bm25,
-                "embed" => FusionMode::Embed,
-                other => {
-                    return Err(format!("invalid --fusion '{}' (auto|bm25|embed)", other).into());
-                }
-            };
+            if !std::path::Path::new(&cmd.file).exists() {
+                return Err(format!("input file not found: {:?}", cmd.file).into());
+            }
             // `--schema` accepts either a path to a JSON Schema file or an
             // inline JSON Schema string. A JSON Schema root is always an
             // object, so a leading `{` (after whitespace) is an unambiguous
@@ -602,7 +612,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let schema_text = if cmd.schema.trim_start().starts_with('{') {
                 cmd.schema.clone()
             } else {
-                std::fs::read_to_string(&cmd.schema)?
+                std::fs::read_to_string(&cmd.schema)
+                    .map_err(|e| format!("schema file not found: {:?} ({})", cmd.schema, e))?
             };
             let schema: serde_json::Value = serde_json::from_str(&schema_text)
                 .map_err(|e| format!("invalid schema JSON: {}", e))?;
@@ -614,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 password: cmd.password,
                 quiet: cmd.quiet,
                 extract_top_k: cmd.top_k,
-                extract_fusion: fusion,
+                extract_offline: cmd.offline,
                 extract_model: cmd.model,
                 extract_model_path: cmd.model_path,
                 ..Default::default()
@@ -662,8 +673,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
-        Commands::ExtractItems(cmd) => {
-            extract::extract(&cmd.pdf_path, cmd.page_num)?;
+        Commands::DumpItems(cmd) => {
+            pdf_read::dump_items(&cmd.pdf_path, cmd.page_num)?;
         }
 
         Commands::ImageBounds(cmd) => {

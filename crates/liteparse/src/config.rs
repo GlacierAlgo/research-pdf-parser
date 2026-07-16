@@ -72,19 +72,20 @@ pub struct LiteParseConfig {
     /// off the nearest right angle (0/90/180/270). Default `false`.
     pub skip_diagonal_text: bool,
     /// Schema extraction: static embedding model (HF id). Only consulted by
-    /// `LiteParse::extract`; resolved local-only (explicit path →
-    /// `LITEPARSE_EXTRACT_MODEL_PATH` → HF cache — download-on-first-use is
-    /// Phase 4). Missing model degrades cleanly to BM25-only.
+    /// `LiteParse::extract`. Resolved local-first (explicit path →
+    /// `LITEPARSE_EXTRACT_MODEL_PATH` → HF cache → liteparse cache), then
+    /// downloaded on first use unless `extract_offline` is set. A model that
+    /// can't be resolved degrades cleanly to BM25-only.
     pub extract_model: String,
     /// Schema extraction: explicit local model directory (overrides
     /// `extract_model` resolution).
     pub extract_model_path: Option<String>,
     /// Schema extraction: candidate spans returned per field.
     pub extract_top_k: usize,
-    /// Schema extraction: ranking fusion (`auto` = always-fuse BM25 ∪ embedding
-    /// via RRF; `bm25` = zero-download lexical only; `embed` = embedding only,
-    /// for known-paraphrastic corpus routing).
-    pub extract_fusion: crate::extractor::FusionMode,
+    /// Schema extraction: skip the model *download* (never touch the network).
+    /// A locally cached model is still resolved and used; when none is found the
+    /// engine degrades to BM25-only. Use for air-gapped / offline runs.
+    pub extract_offline: bool,
 }
 
 /// A page sub-region expressed as the fraction cropped from each side.
@@ -162,7 +163,7 @@ impl Default for LiteParseConfig {
             extract_model: "minishlab/potion-retrieval-32M".to_string(),
             extract_model_path: None,
             extract_top_k: 5,
-            extract_fusion: crate::extractor::FusionMode::Auto,
+            extract_offline: false,
         }
     }
 }

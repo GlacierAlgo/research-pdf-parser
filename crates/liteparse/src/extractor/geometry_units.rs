@@ -1,7 +1,6 @@
-//! Geometry-join pass — synthetic retrieval units from raw item geometry
-//! (Phase 2 of the schema-extraction plan; Rust port of the Phase 0 prototype
-//! `dataset_eval_utils/extract_poc/geometry_units.py`, whose gates and caps
-//! were measured — keep behavioural parity unless re-gating).
+//! Geometry-join pass — synthetic retrieval units from raw item geometry.
+//! The gates and caps here were tuned by measurement; re-measure before
+//! loosening them (see the load-bearing note below).
 //!
 //! Labeled/tabular values often reach the retrieval index as a bare projected
 //! line ("$146,688") with no label context, so no query can retrieve them.
@@ -15,19 +14,19 @@
 //!    value 1–2 line-heights below its label.
 //! 3. **far-header column projection** — for a typed value, walk *up* to the
 //!    nearest x-overlapping column header and *left* to the row's leading
-//!    label; emit "«row» - «header»: «value»". Recovers UNDETECTED tables
-//!    (this is the measured win: fuse R@3 0.47 → 0.53 in Phase 0).
+//!    label; emit "«row» - «header»: «value»". Recovers UNDETECTED tables (the
+//!    biggest measured win of the pass).
 //!
-//! The gates are load-bearing, not defensive: Phase 0 measured that loose
-//! value-ness floods dense pages with prose joins and makes the whole pass
-//! net-NEGATIVE. Hence: `below`/`far-header` require a **typed** value
-//! (money / date / percent / strong-ID — bare numbers and years are the
-//! flood); a per-page unit cap; and de-dupe on unit text.
+//! The gates are load-bearing, not defensive: loose value-ness floods dense
+//! pages with prose joins and makes the whole pass net-NEGATIVE. Hence:
+//! `below`/`far-header` require a **typed** value (money / date / percent /
+//! strong-ID — bare numbers and years are the flood); a per-page unit cap; and
+//! de-dupe on unit text.
 //!
-//! SCOPE GUARDRAIL (from the plan, do not cross): pairwise adjacency joins
-//! over item geometry only. The moment a join wants reading-order /
-//! column-model / table reasoning of its own, that's a shadow projection —
-//! stop, and either expose the signal from `projection.rs` or drop the case.
+//! SCOPE GUARDRAIL (do not cross): pairwise adjacency joins over item geometry
+//! only. The moment a join wants reading-order / column-model / table reasoning
+//! of its own, that's a shadow projection — stop, and either expose the signal
+//! from `projection.rs` or drop the case.
 
 use crate::extraction_unit::{ExtractionUnit, UnitSource};
 use crate::types::{ParsedPage, Rect, TextItem};
@@ -35,7 +34,7 @@ use std::collections::HashSet;
 
 /// Per-page cap on synthetic units. Measured to matter: without it a dense
 /// page floods the index and outranks good natural lines.
-pub const MAX_UNITS_PER_PAGE: usize = 40;
+pub(crate) const MAX_UNITS_PER_PAGE: usize = 40;
 
 /// Row-clustering tolerance as a fraction of item height.
 const Y_TOL_FRAC: f32 = 0.5;
@@ -87,7 +86,7 @@ pub fn geometry_units_by_kind(pages: &[ParsedPage]) -> Vec<(JoinKind, Extraction
         let mut units = page_joins(page.page_number, &items);
         // De-dupe on normalized text, keeping the earliest (cheapest) join,
         // then cap. Join order (rightward, below, far-header) decides what
-        // survives the cap — parity with the measured prototype.
+        // survives the cap.
         let mut seen = HashSet::new();
         units.retain(|(_, u)| seen.insert(u.text.trim().to_lowercase()));
         units.truncate(MAX_UNITS_PER_PAGE);

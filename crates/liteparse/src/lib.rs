@@ -27,8 +27,6 @@ pub mod types;
 #[doc(hidden)]
 pub mod conversion;
 #[doc(hidden)]
-pub mod extract;
-#[doc(hidden)]
 pub mod extraction_unit;
 #[doc(hidden)]
 pub mod extractor;
@@ -51,6 +49,11 @@ pub mod ocr_merge;
 pub mod offset_map;
 #[doc(hidden)]
 pub mod output;
+/// Raw PDFium extraction: document loading, page text items, images, links,
+/// and outline. The low-level layer under `parser`; distinct from `extractor`
+/// (schema extraction).
+#[doc(hidden)]
+pub mod pdf_read;
 #[doc(hidden)]
 pub mod projection;
 #[cfg(not(target_arch = "wasm32"))]

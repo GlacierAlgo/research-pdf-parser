@@ -14,10 +14,6 @@
 //!   - scalar leaf → one retrieval field; `enum`/`format` become value-path
 //!     signal; type comes from schema `type`/`format`, then a name hint (many
 //!     money/date fields are typed plain `string`).
-//!
-//! Ported verbatim from the bench bridge (`examples/extract_bench.rs`), which
-//! itself mirrors the frozen Python stand-in (`extract_poc/extract_cli.py`
-//! `flatten_schema`); the example now consumes this module.
 
 use super::{FieldType, SchemaField};
 use serde_json::Value;
@@ -90,7 +86,7 @@ pub struct FlatSchema {
 
 /// Flatten a standard JSON Schema. Never fails: unrecognized shapes are
 /// skipped (an empty result means nothing in the schema was extractable —
-/// callers should surface that, see the bench bridge's warning).
+/// callers should surface that as an error).
 pub fn flatten_json_schema(root: &Value) -> FlatSchema {
     let mut schema = FlatSchema::default();
     flatten(
@@ -204,6 +200,11 @@ fn flatten(
                     });
                 }
             } else if let Kind::Scalar = item_kind {
+                // A nameless root-level array (`{"type":"array",...}`) names no
+                // field — skip, same as the scalar-root case below.
+                if path.is_empty() {
+                    return;
+                }
                 let name = path.last().cloned().unwrap_or_default();
                 // The array's own description is the retrieval query for the list.
                 let description = node
@@ -228,6 +229,13 @@ fn flatten(
             // Kind::Array item (array-of-array) is dropped — v1-out-of-scope.
         }
         Kind::Scalar => {
+            // A scalar at the schema root (`{}`, or a bare `{"type":"string"}`)
+            // names no field — skip it so an empty/degenerate schema flattens to
+            // zero fields and the caller errors, instead of emitting a phantom
+            // field named "".
+            if path.is_empty() {
+                return;
+            }
             let name = path.last().cloned().unwrap_or_default();
             let description = node
                 .get("description")
@@ -266,7 +274,17 @@ fn leaf_type(node: &Value, name: &str) -> FieldType {
         _ if date_hint => FieldType::Date,
         Some("string") if num_hint => FieldType::Number, // "tax_total": string → numeric
         Some("string") | None => FieldType::Str,
-        _ => FieldType::Str,
+        // A `type` keyword with no value scanner (e.g. "currency", "geo"): the
+        // field still retrieves and returns its raw span, but the caller should
+        // know it won't be coerced.
+        Some(other) => {
+            eprintln!(
+                "warning: field {:?} has unsupported schema type {:?}; \
+                 treating as string",
+                name, other
+            );
+            FieldType::Str
+        }
     }
 }
 
@@ -382,6 +400,23 @@ mod tests {
         assert_eq!(flat.fields[1].description, "vendor legal name");
         // Missing description falls back to the path words.
         assert_eq!(flat.fields[0].description, "vendor address city");
+    }
+
+    #[test]
+    fn degenerate_root_schemas_flatten_to_nothing() {
+        // `{}` and a bare root scalar name no field — they must flatten to zero
+        // extractable fields (the caller then errors) rather than a phantom "".
+        for root in [
+            json!({}),
+            json!({"type": "string"}),
+            json!({"type": "array", "items": {"type": "string"}}),
+        ] {
+            let flat = flatten_json_schema(&root);
+            assert!(
+                flat.fields.is_empty() && flat.object_arrays.is_empty(),
+                "expected no extractable fields for {root}"
+            );
+        }
     }
 
     #[test]

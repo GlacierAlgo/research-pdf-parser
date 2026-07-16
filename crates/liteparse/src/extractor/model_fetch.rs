@@ -1,12 +1,12 @@
-//! Download-on-first-use for the static embedding model (EXTRACT_PLAN.md,
-//! Phase 4) — the tessdata pattern from `ocr/tesseract.rs` applied to model
-//! files: platform cache dir, one-time size notice, temp-file + atomic rename
-//! so concurrent first use is safe and a partial download never resolves.
+//! Download-on-first-use for the static embedding model — the tessdata pattern
+//! from `ocr/tesseract.rs` applied to model files: platform cache dir, one-time
+//! size notice, temp-file + atomic rename so concurrent first use is safe and a
+//! partial download never resolves.
 //!
-//! Nothing here runs unless extraction actually needs the model:
-//! `extract_fusion = bm25` remains a genuinely zero-download path, and
-//! [`ensure_model`] returns immediately when [`resolve_model_dir`] already
-//! finds the files (explicit path, env var, HF cache, or a previous download).
+//! Nothing here runs unless extraction actually needs the model: the
+//! `extract_offline` config skips it entirely, and [`ensure_model`] returns
+//! immediately when [`resolve_model_dir`] already finds the files (explicit
+//! path, env var, HF cache, or a previous download).
 //!
 //! Files are fetched from the Hugging Face hub (`resolve/main`). The
 //! `model.safetensors` weights land last: [`resolve_model_dir`] requires

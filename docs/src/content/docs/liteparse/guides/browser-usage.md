@@ -2,7 +2,7 @@
 title: Browser Usage (WASM)
 description: Run LiteParse entirely in the browser with the WASM package.
 sidebar:
-  order: 7
+  order: 8
 ---
 
 LiteParse ships a WebAssembly package that runs entirely in the browser — no server, no cloud calls. It supports PDF parsing and custom OCR engines implemented in JavaScript.

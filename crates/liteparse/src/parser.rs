@@ -2,7 +2,6 @@ use crate::config::{LiteParseConfig, parse_target_pages};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::conversion;
 use crate::error::LiteParseError;
-use crate::extract;
 use crate::ocr::OcrEngine;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ocr::http_simple::HttpOcrEngine;
@@ -10,6 +9,7 @@ use crate::ocr::http_simple::HttpOcrEngine;
 use crate::ocr::tesseract::TesseractOcrEngine;
 use crate::ocr_merge;
 use crate::output::markdown;
+use crate::pdf_read;
 use crate::projection;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::render;
@@ -162,9 +162,9 @@ impl LiteParse {
         let password = self.config.password.as_deref();
 
         let lib = Library::init();
-        let document = extract::load_document_from_input(&lib, &validated_input, password)?;
+        let document = pdf_read::load_document_from_input(&lib, &validated_input, password)?;
 
-        let (pages, _) = extract::extract_pages_and_images(
+        let (pages, _) = pdf_read::extract_pages_and_images(
             &document,
             target_pages.as_deref(),
             self.config.max_pages,
@@ -218,11 +218,15 @@ impl LiteParse {
     /// tier to branch on (act on `strong` / verify `weak` / escalate `none`).
     /// Values are verbatim spans — normalization is deliberately out of scope.
     ///
-    /// Engine knobs live on [`LiteParseConfig`]: `extract_fusion` (`auto` =
-    /// BM25 ∪ static embedding; `bm25` needs no model at all), `extract_model`
-    /// / `extract_model_path` (local files preferred; downloaded on first use
-    /// on native builds — any resolution/download failure logs and degrades to
-    /// BM25), `extract_top_k`.
+    /// Retrieval always fuses BM25 with a static embedding model (RRF), degrading
+    /// to BM25-only when no model is available. Engine knobs live on
+    /// [`LiteParseConfig`]: `extract_model` / `extract_model_path` (local files
+    /// preferred; downloaded on first use on native builds — any
+    /// resolution/download failure logs and degrades to BM25), `extract_offline`
+    /// (skip the download; use a cached model if present), `extract_top_k`.
+    ///
+    /// A schema that flattens to zero extractable fields is an error, not an
+    /// empty result.
     pub async fn extract(
         &self,
         input: PdfInput,
@@ -243,25 +247,39 @@ impl LiteParse {
         let parsed = self.parse_input(input).await?;
 
         #[cfg_attr(not(feature = "static-embed"), allow(unused_mut))]
-        let mut extractor = LocalExtractor::from_pages(&parsed.pages)
-            .with_fusion(self.config.extract_fusion)
-            .with_top_k(self.config.extract_top_k);
-        // Attach the static embedder unless the caller asked for pure BM25 (the
-        // zero-download path). Resolution prefers local files (explicit path,
-        // env var, HF cache, prior download); a full miss downloads on first
-        // use (native builds, tessdata pattern). Any failure degrades to BM25.
+        let mut extractor =
+            LocalExtractor::from_pages(&parsed.pages).with_top_k(self.config.extract_top_k);
+        // Always-fuse: attach the static embedder whenever it resolves.
+        // Resolution prefers local files (explicit path, env var, HF cache,
+        // prior download); a full miss downloads on first use (native builds,
+        // tessdata pattern) unless `extract_offline` is set. Any failure
+        // degrades to BM25-only.
         #[cfg(feature = "static-embed")]
-        if self.config.extract_fusion != crate::extractor::FusionMode::Bm25 {
-            use crate::extractor::static_embed::{StaticEmbedder, resolve_model_dir};
+        {
+            use crate::extractor::static_embed::{StaticEmbedder, is_model_dir, resolve_model_dir};
             let explicit = self
                 .config
                 .extract_model_path
                 .as_deref()
                 .map(std::path::Path::new);
+            // An explicit `--model-path` the caller asserted must resolve — a
+            // typo silently falling through to the env var / cached default
+            // model is a trust bug, so validate the path itself and refuse it up
+            // front. (`resolve_model_dir` would mask it via its fallbacks.)
+            if let Some(path) = explicit
+                && !is_model_dir(path)
+            {
+                return Err(format!(
+                    "extract model path does not contain a model \
+                     (need tokenizer.json + model.safetensors): {}",
+                    path.display()
+                )
+                .into());
+            }
             #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
             let mut dir = resolve_model_dir(&self.config.extract_model, explicit);
             #[cfg(not(target_arch = "wasm32"))]
-            if dir.is_none() {
+            if dir.is_none() && !self.config.extract_offline {
                 match crate::extractor::model_fetch::ensure_model(
                     &self.config.extract_model,
                     explicit,
@@ -405,9 +423,9 @@ impl LiteParse {
 
         let (pages, ocr_rendered, outline, images) = {
             let lib = Library::init();
-            let document = extract::load_document_from_input(&lib, &validated_input, password)?;
-            let outline = extract::extract_outline(&document);
-            let (pages, images) = extract::extract_pages_and_images(
+            let document = pdf_read::load_document_from_input(&lib, &validated_input, password)?;
+            let outline = pdf_read::extract_outline(&document);
+            let (pages, images) = pdf_read::extract_pages_and_images(
                 &document,
                 target_pages.as_deref(),
                 self.config.max_pages,
@@ -470,7 +488,7 @@ impl LiteParse {
         // Caller-requested content filters (page-region crop, diagonal-text
         // removal). Runs after OCR merge so it also drops OCR text outside the
         // crop region, and before projection so filtered items never surface.
-        extract::apply_content_filters(
+        pdf_read::apply_content_filters(
             &mut pages,
             self.config.crop_box.as_ref(),
             self.config.skip_diagonal_text,

@@ -321,6 +321,88 @@ Options:
 Prints per-page JSON to stdout and a `COMPLEX`/`SIMPLE` verdict to stderr; exits non-zero
 when any page needs OCR, so it composes as a shell predicate.
 
+## Schema Extraction
+
+`lit extract` pulls specific fields out of a document given a JSON Schema. It is a
+**narrowing signal with provenance** — for each field it returns candidate spans with a
+relevance score, page, and bounding box, plus a coarse trust `signal` — not an LLM-grade
+single answer. Use it to locate values (and feed a downstream model), or as a fast,
+local, zero-LLM extractor for well-structured documents.
+
+```bash
+# Inline schema (anything starting with `{` is treated as inline)
+lit extract invoice.pdf --schema '{
+  "type": "object",
+  "properties": {
+    "invoice_number": {"type": "string", "description": "the invoice or document number"},
+    "total":          {"type": "number", "description": "grand total amount due"},
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "description": {"type": "string", "description": "line item description"},
+          "amount":      {"type": "number", "description": "line item amount"}
+        }
+      }
+    }
+  }
+}'
+
+# Or point --schema at a schema file
+lit extract invoice.pdf --schema schema.json --output result.json
+```
+
+Nested objects flatten to dotted field names (`vendor.address.city`); an array of objects
+(`line_items`) extracts one record per detected table row. Field `description`s drive
+retrieval; `enum`/`format` (`email`/`uri`/`date`) sharpen the extracted value.
+
+Each field in the output carries:
+
+- **`value`** — the extracted answer, or `null` when the engine makes no claim.
+- **`signal`** — the trust tier to branch on: `strong` (a typed scanner isolated the value
+  with lexical/cosine support), `weak` (a retrieval match only — verify before use), or
+  `none` (no claim; spans kept for provenance only).
+- **`score`** / **`page`** / **`bbox`** — relevance of the headline span and where it is.
+- **`candidates`** — the top-k spans, sorted by `score` descending. Each has the full span
+  `text` (what you'd highlight), a narrowed `value` only when a scanner isolated a
+  sub-value, and a `source`: `natural_line` (a projected text line), `geometry_join`
+  (label+value assembled from adjacent spans), or `header_cell` (a detected table cell).
+
+```json
+{
+  "fields": [
+    {
+      "name": "invoice_number",
+      "value": "INV-2024-0042",
+      "signal": "strong",
+      "score": 0.71,
+      "page": 0,
+      "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
+      "candidates": [
+        { "text": "Invoice Number: INV-2024-0042", "value": "INV-2024-0042",
+          "score": 0.71, "page": 0, "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
+          "source": "natural_line" }
+      ]
+    }
+  ],
+  "arrays": []
+}
+```
+
+Retrieval fuses BM25 with a static embedding model (`minishlab/potion-retrieval-32M`,
+~250 MB). The model is resolved local-first (explicit `--model-path`,
+`LITEPARSE_EXTRACT_MODEL_PATH`, the Hugging Face cache, or a prior download) and downloaded
+on first use, landing in the platform cache dir (`LITEPARSE_MODELS_DIR` to override). If it
+can't be resolved, retrieval degrades cleanly to BM25-only.
+
+Pre-fetch the model, or run without ever touching the network:
+
+```bash
+lit models pull                                  # download ahead of time
+lit extract doc.pdf --schema schema.json --offline   # never download; BM25-only if uncached
+```
+
 ## OCR Setup
 
 ### Default: Tesseract
@@ -407,6 +489,8 @@ choco install imagemagick.app
 | Variable | Description |
 |----------|-------------|
 | `TESSDATA_PREFIX` | Path to a directory containing Tesseract `.traineddata` files. Used for offline/air-gapped environments. |
+| `LITEPARSE_EXTRACT_MODEL_PATH` | Explicit directory holding the schema-extraction embedding model (`tokenizer.json` + `model.safetensors`). Checked before the Hugging Face cache and download. |
+| `LITEPARSE_MODELS_DIR` | Override the cache directory where `lit models pull` / first-use download stores extraction models (default: the platform cache dir). |
 
 ## Development
 

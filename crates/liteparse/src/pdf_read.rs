@@ -268,8 +268,9 @@ fn extract_page_struct_nodes(page: &Page, view_box: &RectF) -> Vec<StructNode> {
         .collect()
 }
 
-/// Extract raw text items and print each page as a JSON-line object to stdout.
-pub fn extract(pdf_path: &str, page_num: Option<u32>) -> Result<(), LiteParseError> {
+/// Dump raw text items, printing each page as a JSON-line object to stdout.
+/// Backs the hidden `lit dump-items` dev subcommand.
+pub fn dump_items(pdf_path: &str, page_num: Option<u32>) -> Result<(), LiteParseError> {
     let target_pages: Option<Vec<u32>> = page_num.map(|p| vec![p]);
     let pages = extract_pages_from_input(
         &PdfInput::Path(pdf_path.to_string()),

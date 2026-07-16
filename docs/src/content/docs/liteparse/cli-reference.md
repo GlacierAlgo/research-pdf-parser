@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-LiteParse provides the `lit` CLI with four commands: `parse`, `batch-parse`, `screenshot`, and `is-complex`. The CLI is the same whether installed via `npm`, `pip`, or built from Rust source.
+LiteParse provides the `lit` CLI with these commands: `parse`, `batch-parse`, `screenshot`, `is-complex`, `extract`, and `models`. The CLI is the same whether installed via `npm`, `pip`, or built from Rust source.
 
 ## `lit parse`
 
@@ -201,6 +201,74 @@ lit is-complex document.pdf --quiet && lit parse document.pdf --no-ocr
 
 # List the page numbers that need OCR
 lit is-complex document.pdf --compact | jq '[.[] | select(.needs_ocr) | .page_number]'
+```
+
+---
+
+## `lit extract`
+
+Pull specific fields out of a document from a JSON Schema — candidate values with scores, pages, and bounding boxes. See the [Schema Extraction guide](/liteparse/guides/schema-extraction/) for the output shape and trust signals.
+
+```
+lit extract [options] <file> --schema <schema>
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `file` | Path to the document file |
+
+### Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--schema <schema>` | JSON Schema — a file path, or inline JSON starting with `{`. **Required.** | — |
+| `-o, --output <file>` | Write the result JSON to a file instead of stdout | — |
+| `--compact` | Compact JSON instead of pretty-printed | — |
+| `--top-k <n>` | Candidate spans returned per field | `5` |
+| `--model <id>` | Static embedding model (Hugging Face id) | `minishlab/potion-retrieval-32M` |
+| `--model-path <dir>` | Explicit local model directory (overrides `--model`) | — |
+| `--offline` | Never download the model; use a cached one if present, else BM25-only | — |
+| `--no-ocr` | Disable OCR | — |
+| `--max-pages <n>` | Maximum pages to parse | `1000` |
+| `--target-pages <pages>` | Pages to parse (e.g., `"1-5,10"`) | — (all pages) |
+| `--password <password>` | Password for encrypted/protected documents | — |
+| `-q, --quiet` | Suppress progress logging on stderr | — |
+
+### Examples
+
+```bash
+# Inline schema
+lit extract invoice.pdf --schema '{"type":"object","properties":{"total":{"type":"number","description":"grand total amount due"}}}'
+
+# Schema from a file, result written to disk
+lit extract invoice.pdf --schema schema.json --output result.json
+
+# Run without touching the network (BM25-only if the model isn't cached)
+lit extract invoice.pdf --schema schema.json --offline
+```
+
+---
+
+## `lit models`
+
+Manage the embedding model used by `lit extract`.
+
+```
+lit models pull [model]
+```
+
+`lit models pull` downloads an extraction embedding model to the liteparse cache (idempotent — it resolves an existing local copy first) and prints the model directory. The default model is ~250 MB and lands in the platform cache directory; set `LITEPARSE_MODELS_DIR` to override.
+
+### Examples
+
+```bash
+# Pre-fetch the default model (e.g. in CI or a Docker build)
+lit models pull
+
+# Pull a specific model
+lit models pull minishlab/potion-retrieval-32M
 ```
 
 ---

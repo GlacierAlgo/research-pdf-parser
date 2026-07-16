@@ -4748,7 +4748,7 @@ fn build_one_line(
     let mut size_weights: HashMap<u32, (f32, usize)> = HashMap::new();
     let mut height_weights: HashMap<u32, (f32, usize)> = HashMap::new();
     // Matrix-derived true on-page size (`Tf_size × text_matrix_scale`, computed
-    // in extract.rs). For matrix-baked-size fonts this is the precise size the
+    // in pdf_read.rs). For matrix-baked-size fonts this is the precise size the
     // raw `font_size` (≈1.0) hides; jitter-free, unlike bbox height.
     let mut font_height_weights: HashMap<u32, (f32, usize)> = HashMap::new();
     let mut name_weights: HashMap<String, usize> = HashMap::new();

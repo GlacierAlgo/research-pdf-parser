@@ -59,11 +59,11 @@ pub struct TextItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
     /// Target URI when this item falls inside a hyperlink annotation's
-    /// rectangle. Populated in `extract.rs`; consumed by the markdown emitter.
+    /// rectangle. Populated in `pdf_read.rs`; consumed by the markdown emitter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     /// Whether a thin horizontal stroke/rect crosses this item's vertical middle
-    /// band (a strikethrough line). Populated in `extract.rs`; consumed by the
+    /// band (a strikethrough line). Populated in `pdf_read.rs`; consumed by the
     /// markdown emitter to wrap the text in `~~…~~`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub strike: bool,
