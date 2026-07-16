@@ -112,10 +112,10 @@ pub struct ExtractionSchema {
 /// A single ranked candidate span for a field.
 #[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
-    /// The sub-value a type/format/enum scanner isolated out of `text` (e.g.
-    /// span `"Total: $146,688"` → `"$146,688"`). Present **only** when a scanner
-    /// actually fired; absent for a plain retrieval match, where `text` is the
-    /// whole span. Its presence is exactly the old `typed_match` flag.
+    /// The narrowed sub-value isolated out of `text` — by a type/format/enum
+    /// scanner (span `"Total: $146,688"` → `"$146,688"`) or, for plain fields, a
+    /// clean `Label:` strip. Present **only** when the engine found something
+    /// narrower than the full span; absent otherwise, where `text` is the value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// The full source unit text — always carried so callers can verify the
@@ -125,8 +125,8 @@ pub struct Candidate {
     /// the embedding model it is cosine similarity to the field description
     /// (absolute, comparable across documents — usable to gate a corpus); in
     /// bm25-only mode it is a saturating squash of the lexical score (coarser,
-    /// comparable only within one run). Explicitly **not** a probability — for
-    /// a trust decision branch on [`FieldResult::signal`], not this number.
+    /// comparable only within one run). Explicitly **not** a probability — it
+    /// orders candidates; it is not a calibrated confidence.
     pub score: f32,
     pub page: usize,
     /// `None` when the candidate's source row couldn't be resolved back to a
@@ -136,43 +136,19 @@ pub struct Candidate {
     pub source: UnitSource,
 }
 
-/// Coarse trust tier for a resolved field — the escalation signal callers
-/// (reviewers, agents) branch on: act on `strong`, verify `weak`, escalate or
-/// skip `none`. This is a **heuristic over observable value-path facts**, not a
-/// calibrated confidence (scores stay unitless): `strong` means a value-shaped
-/// scanner actually isolated the value
-/// (typed/format/enum match or a label-anchored cell) *on a span with lexical
-/// support or a real cosine to the query* — a value shape mined off an
-/// embed-only noise span does not qualify; `weak` means the headline is a raw
-/// retrieved span the engine could not narrow — but one with lexical support;
-/// `none` means no answer: nothing retrieved, an enum/format scanner that
-/// matched nowhere (never guess), or — under fused retrieval — a span nominated
-/// by the embedding alone, with no query token in it (`candidates` still carry
-/// the spans in the latter cases; only the value claim is withheld).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Signal {
-    Strong,
-    Weak,
-    None,
-}
-
-/// Per-field extraction result. The headline `value`/`score`/`page`/`bbox`
-/// mirror the top candidate; `None` throughout when retrieval found nothing.
+/// Per-field extraction result: the field name and its ranked candidate spans.
+///
+/// Deliberately **not** a single headline answer — extraction is a narrowing
+/// tool, so it reports the ranked [`Candidate`]s (by descending [`score`], with
+/// page/bbox provenance) and lets the caller decide. `candidates` is empty when
+/// retrieval found nothing.
+///
+/// [`score`]: Candidate::score
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldResult {
     pub name: String,
-    pub value: Option<String>,
-    /// How much to trust `value` — see [`Signal`].
-    pub signal: Signal,
-    /// Relevance of the headline span in `[0,1]` (the top candidate's
-    /// [`Candidate::score`]): embedding cosine, or a squashed BM25 score in
-    /// bm25-only mode. A ranking/filtering aid, not a probability — trust is
-    /// [`signal`](Self::signal). `None` only on a miss.
-    pub score: Option<f32>,
-    pub page: Option<usize>,
-    pub bbox: Option<Rect>,
-    /// Top-k deduped candidates in rank order. Empty on a miss.
+    /// Top-k deduped candidates, sorted by [`Candidate::score`] descending.
+    /// Empty on a miss.
     pub candidates: Vec<Candidate>,
 }
 
@@ -180,11 +156,6 @@ impl FieldResult {
     fn miss(name: &str) -> Self {
         FieldResult {
             name: name.to_string(),
-            value: None,
-            signal: Signal::None,
-            score: None,
-            page: None,
-            bbox: None,
             candidates: Vec::new(),
         }
     }
@@ -232,53 +203,24 @@ pub struct ObjectArrayResult {
 }
 
 /// One object-array group in a document-level extraction: the group's dotted
-/// schema path, a group-level [`Signal`], and the grouped records.
+/// schema path and the grouped records (one per detected table row).
 #[derive(Debug, Clone, Serialize)]
 pub struct ArrayFieldResult {
     pub name: String,
-    /// `none` = no table matched (no records); `strong` = at least one record
-    /// resolved half or more of its sub-fields — at least two of them, at least
-    /// one value-shaped (a sub-field with a `strong` signal of its own); `weak`
-    /// = records exist but are sparse (partial table detection or poor header
-    /// matching), or nothing in them is value-shaped.
-    pub signal: Signal,
     pub records: Vec<Record>,
 }
 
 impl ArrayFieldResult {
     pub(crate) fn new(name: String, records: Vec<Record>) -> Self {
-        // A raw non-empty cell always yields *a* value, so "values present"
-        // alone over-promises (one junk record resolving 1 of 2 sub-fields used
-        // to read `strong`). Demand density (≥ half, ≥ 2 — a single resolved
-        // cell is never corroboration unless the record only HAS one field) and
-        // shape (some cell the scanners actually isolated).
-        let record_is_strong = |r: &Record| {
-            let resolved = r.fields.iter().filter(|f| f.value.is_some()).count();
-            resolved * 2 >= r.fields.len()
-                && resolved >= 2.min(r.fields.len())
-                && resolved > 0
-                && r.fields.iter().any(|f| f.signal == Signal::Strong)
-        };
-        let signal = if records.is_empty() {
-            Signal::None
-        } else if records.iter().any(record_is_strong) {
-            Signal::Strong
-        } else {
-            Signal::Weak
-        };
-        ArrayFieldResult {
-            name,
-            signal,
-            records,
-        }
+        ArrayFieldResult { name, records }
     }
 }
 
 /// Document-level extraction result: the deliverable of `LiteParse::extract`.
 /// Scalar leaves (nested objects flattened to dotted names) plus object-array
-/// groups. The contract is **narrowing signal with provenance** — top-k
-/// candidate spans, a score, a page and a bbox per field — not LLM-grade
-/// single-answer extraction; callers branch on [`Signal`] and verify through
+/// groups. The contract is **narrowing with provenance** — top-k ranked
+/// candidate spans (each with a score, page, and bbox) per field, not
+/// LLM-grade single-answer extraction; callers rank and verify through
 /// `candidates`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentExtraction {
@@ -436,8 +378,8 @@ const RRF_K: f32 = 60.0;
 /// Saturating constant for [`squash_bm25`]. BM25 sums are unbounded and
 /// query-length dependent, so there is no principled max to divide by; `s/(s+K)`
 /// maps a "decent" top-1 match (~K) to ~0.5 and saturates toward 1. Chosen by
-/// eyeballing top-1 scores on the demo corpus — a coarse ruler, not a calibrated
-/// one (the honest cross-run trust signal is [`Signal`], not this number).
+/// eyeballing top-1 scores on the demo corpus — a coarse ruler for ranking, not
+/// a calibrated probability.
 const BM25_SQUASH_K: f32 = 3.0;
 
 /// Squash an unbounded BM25 score into `(0, 1)`, monotonically. Used for the
@@ -447,14 +389,6 @@ fn squash_bm25(score: f32) -> f32 {
     let s = score.max(0.0);
     s / (s + BM25_SQUASH_K)
 }
-
-/// Cosine floor below which an *unanchored* typed hit is refused `strong`
-/// (the typed-hit anchor gate in `extract_field`). Only consulted under fused
-/// retrieval with an embedder, where the rescored candidate score IS the
-/// query↔span cosine. Dogfood fabrications (digit runs mined off garbled-OCR /
-/// off-topic spans) all sat at ≤ 0.13; the legitimate embed-only typed hits
-/// observed sit ≥ 0.39. Midpoint with margin both ways.
-const TYPED_UNANCHORED_COSINE_FLOOR: f32 = 0.25;
 
 /// Reciprocal-rank-fuse two rankings over `n` units: each unit contributes
 /// `1/(RRF_K + position)` per ranking, summed. Units missing from a (sparse
@@ -659,7 +593,7 @@ impl LocalExtractor {
         // A field can retrieve the same text via distinct units (e.g. a natural
         // line and a synthetic join over the same items) — collapse those.
         // `cand_docs` remembers each candidate's unit index (parallel vec) so
-        // the signal tier can ask the BM25 side about it afterwards.
+        // `rescore_relevance` can look the unit vector up afterwards.
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut cand_docs: Vec<usize> = Vec::new();
         let mut seen_text = std::collections::HashSet::new();
@@ -677,11 +611,10 @@ impl LocalExtractor {
             let Some(prov) = unit.provenance(&self.map) else {
                 continue;
             };
-            // Value path: pull a typed/enum/format sub-value out of the span.
-            // `None` (no scanner fired) leaves the candidate carrying only its
-            // full `text` — the label-stripped fallback is computed lazily at
-            // headline selection, not stored per candidate.
-            let value = value_span::typed_value(field, &unit.text);
+            // Value path: narrow the span to its sub-value when we can (typed /
+            // enum / format scanner, else a label strip). `None` leaves the
+            // candidate carrying only its full `text`.
+            let value = value_span::narrowed_value(field, &unit.text);
             candidates.push(Candidate {
                 value,
                 text: unit.text.clone(),
@@ -701,74 +634,13 @@ impl LocalExtractor {
         // fusion score above chose the ordering; callers get a comparable number.
         self.rescore_relevance(&query, &mut candidates, &cand_docs);
 
-        // A scanner isolated a value on candidate `i` exactly when its `value`
-        // is `Some`. Typed-hit anchor gate: such a hit counts as `strong` only
-        // if its span has lexical support (BM25-anchored) or a real cosine to
-        // the query. Under fused retrieval the cosine side always nominates a
-        // neighbor, so without this an embed-only noise span wearing a value
-        // shape (a street number, a garbled OCR digit run) could promote to
-        // `strong` on zero query-token overlap at near-zero cosine.
-        let anchored = self.anchored_flags(&query, &cand_docs);
-        let typed_ok: Vec<bool> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                c.value.is_some() && (anchored[i] || c.score >= TYPED_UNANCHORED_COSINE_FLOOR)
-            })
-            .collect();
-        // Headline = the highest-*ranked* candidate whose typed value survives
-        // the gate ("pick a value-bearing candidate from top-k, not blind
-        // top-1"), else rank 0. Chosen in retrieval order, before the output
-        // sort below reorders `candidates` by displayed score.
-        let headline = typed_ok.iter().position(|&ok| ok).unwrap_or(0);
-        // Value-shaped scanners never guess: an enum with no supported choice,
-        // or an *implemented* `format` scanner (email/uri/date) that found its
-        // shape nowhere in the top-k, means the answer is null — not the raw
-        // span. (A format keyword we have no scanner for imposes no such claim.)
-        let scanner_no_match = !typed_ok.iter().any(|&ok| ok)
-            && (!field.choices.is_empty()
-                || field
-                    .format
-                    .as_deref()
-                    .is_some_and(value_span::has_format_scanner));
-        let signal = if scanner_no_match {
-            Signal::None
-        } else if typed_ok[headline] {
-            Signal::Strong
-        } else if !anchored[headline] {
-            // Fused retrieval is dense — the cosine side always nominates a
-            // neighbor — so a span with zero BM25 support is embed-only noise
-            // pure BM25 would have answered with a clean miss (this covers both
-            // raw spans and gated-out typed hits). Report `none` honestly; the
-            // spans stay in `candidates`.
-            Signal::None
-        } else {
-            Signal::Weak
-        };
-        // Capture the headline's fields before the output sort reorders
-        // `candidates`. A plain (untyped) headline uses the label-stripped span
-        // as its value; `none` keeps the spans for provenance but claims none.
-        let h = &candidates[headline];
-        let (h_score, h_page, h_bbox) = (h.score, h.page, h.bbox.clone());
-        let value = (signal != Signal::None).then(|| {
-            h.value
-                .clone()
-                .unwrap_or_else(|| value_span::fallback_value(h.text.trim()))
-        });
-
         // Output contract: candidates sorted by displayed score descending, so
         // `candidates[0]` is never shown beaten by a lower entry. Stable, so
-        // score ties keep retrieval order. The headline (above) is independent
-        // of this order — it was chosen by the value gate, not the top score.
+        // score ties keep retrieval order.
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         FieldResult {
             name: field.name.clone(),
-            value,
-            signal,
-            score: Some(h_score),
-            page: Some(h_page),
-            bbox: h_bbox,
             candidates,
         }
     }
@@ -781,7 +653,7 @@ impl LocalExtractor {
     /// (so it can gate a corpus: "keep docs scoring > 0.5 for this field").
     /// Otherwise it is a saturating [`squash_bm25`] of the raw BM25 score —
     /// monotonic but coarser, comparable only within one bm25 run. Neither is a
-    /// probability; the cross-run trust signal is [`Signal`].
+    /// probability — a ranking aid, not a trust score.
     ///
     /// `docs[i]` is `candidates[i]`'s unit index (the parallel vec the caller
     /// already tracks). Cosine is decoupled from the RRF *ranking* on purpose:
@@ -803,28 +675,6 @@ impl LocalExtractor {
         for c in candidates.iter_mut() {
             c.score = squash_bm25(c.score);
         }
-    }
-
-    /// Per-candidate lexical anchoring: is each unit in the BM25 ranking for
-    /// `query` (shares at least one token)? One scoring pass for the whole
-    /// candidate set. Only meaningful in fused (Auto) mode with an embedder
-    /// attached — the one configuration where a candidate can appear with no
-    /// lexical support at all; everywhere else the answer is all-true
-    /// (pure-BM25 candidates are anchored by construction, and explicit
-    /// `Embed` mode is the caller opting into cosine-only retrieval).
-    fn anchored_flags(&self, query: &str, docs: &[usize]) -> Vec<bool> {
-        #[cfg(feature = "static-embed")]
-        if self.embed.is_some() && self.fusion == FusionMode::Auto {
-            let hits: std::collections::HashSet<usize> = self
-                .index
-                .score(query)
-                .into_iter()
-                .map(|(d, _)| d)
-                .collect();
-            return docs.iter().map(|d| hits.contains(d)).collect();
-        }
-        let _ = query;
-        vec![true; docs.len()]
     }
 
     // ── Object-array (row grouping) ──────────────────────────────────────────
@@ -849,7 +699,7 @@ impl LocalExtractor {
     ///   example phrases), so without this gate meta fields get force-mapped
     ///   onto data columns and every body row becomes a garbage record.
     /// - **Row gates:** a body row is dropped when (a) no mapped column has a
-    ///   non-empty cell (an all-null record carries no signal), or (b) every
+    ///   non-empty cell (an all-null record carries nothing), or (b) every
     ///   resolved cell merely echoes its own field name / column header — the
     ///   signature of a wrapped header line binned as a body row ("At Closing"
     ///   under `borrower_paid_at_closing`), not of data.
@@ -1092,49 +942,23 @@ fn cell_field_result(
     // Column matching is lexical (BM25 over header cells), so the cell score is
     // squashed into the same [0,1] relevance the bm25 scalar path reports.
     let score = squash_bm25(score);
-    // The scanner's isolated sub-value (`None` when nothing fired). Its presence
-    // is the cell's `typed_match`.
-    let typed = value_span::typed_value(field, cell);
-    let typed_match = typed.is_some();
-    // Same never-guess rule as the scalar path: enum with no supported choice,
-    // or an implemented format scanner that found nothing, yields a null value
-    // (the cell still surfaces as a candidate).
-    let scanner_no_match = !typed_match
-        && (!field.choices.is_empty()
-            || field
-                .format
-                .as_deref()
-                .is_some_and(value_span::has_format_scanner));
-
+    // Narrow the cell to its sub-value when a scanner fires (a bare data cell
+    // usually is the value already, so this is often `None` and `text` carries
+    // it); never-guess fields with no match yield `None`.
+    let value = value_span::narrowed_value(field, cell);
     let page = provenance.map(|p| p.page).unwrap_or(grid_page);
     let bbox = provenance.map(|p| p.bbox.clone());
     let candidate = Candidate {
-        value: typed.clone(),
+        value,
         text: cell.to_string(),
         score,
         page,
-        bbox: bbox.clone(),
-        source: UnitSource::HeaderCell,
-    };
-    let signal = if scanner_no_match {
-        Signal::None
-    } else if typed_match {
-        Signal::Strong
-    } else {
-        Signal::Weak
-    };
-    // Field value: the scanner's value if it fired, else the label-stripped
-    // cell — unless a never-guess scanner refused, which claims none.
-    let field_value =
-        (!scanner_no_match).then(|| typed.unwrap_or_else(|| value_span::fallback_value(cell)));
-    FieldResult {
-        name: field.name.clone(),
-        value: field_value,
-        signal,
-        score: Some(score),
-        page: Some(page),
         // Only claim a bbox when the row actually resolved to a source line.
         bbox,
+        source: UnitSource::HeaderCell,
+    };
+    FieldResult {
+        name: field.name.clone(),
         candidates: vec![candidate],
     }
 }
@@ -1196,12 +1020,12 @@ mod tests {
         let out = ex.extract(&schema);
         assert_eq!(out.fields.len(), 1);
         let r = &out.fields[0];
-        // Ranking picks the invoice line; the raw span is preserved on the
-        // candidate, while the headline value is label-trimmed.
+        // Ranking picks the invoice line; the candidate keeps the full span as
+        // `text` and the label-stripped value in `value`.
         assert_eq!(r.candidates[0].text, "Invoice Number: INV-2024-0042");
-        assert_eq!(r.value.as_deref(), Some("INV-2024-0042"));
-        assert_eq!(r.page, Some(1));
-        assert!(r.score.unwrap() > 0.0);
+        assert_eq!(r.candidates[0].value.as_deref(), Some("INV-2024-0042"));
+        assert_eq!(r.candidates[0].page, 1);
+        assert!(r.candidates[0].score > 0.0);
     }
 
     #[test]
@@ -1211,7 +1035,6 @@ mod tests {
             fields: vec![field("shipment_weight", "gross shipment weight kilograms")],
         };
         let r = &ex.extract(&schema).fields[0];
-        assert_eq!(r.value, None);
         assert!(r.candidates.is_empty());
     }
 
@@ -1224,7 +1047,7 @@ mod tests {
             fields: vec![field("vat", "total vat amount")],
         };
         let r = &ex.extract(&schema).fields[0];
-        assert_eq!(r.value.as_deref(), Some("Total VAT 18"));
+        assert_eq!(r.candidates[0].text, "Total VAT 18");
     }
 
     #[test]
@@ -1251,15 +1074,14 @@ mod tests {
             }],
         };
         let r = &ex.extract(&schema).fields[0];
-        // Date type now pulls the value substring out of the span.
-        assert_eq!(r.value.as_deref(), Some("2024-01-15"));
+        // Date type pulls the value substring out onto the candidate.
         assert_eq!(r.candidates[0].value.as_deref(), Some("2024-01-15"));
     }
 
     #[test]
-    fn number_field_extracts_value_and_selects_value_bearing_candidate() {
-        // Top BM25 hit is a labelled header with no number; the value lives one
-        // rank down. Value-bearing selection should surface the amount.
+    fn number_field_extracts_value_substring() {
+        // The amount lives on the second line; its candidate carries the
+        // isolated number as `value` while the header line does not.
         let ex = extractor(&["Total amount payable", "Amount 1,250.00"]);
         let schema = ExtractionSchema {
             fields: vec![SchemaField {
@@ -1271,7 +1093,11 @@ mod tests {
             }],
         };
         let r = &ex.extract(&schema).fields[0];
-        assert_eq!(r.value.as_deref(), Some("1,250.00"));
+        assert!(
+            r.candidates
+                .iter()
+                .any(|c| c.value.as_deref() == Some("1,250.00"))
+        );
     }
 
     #[test]
@@ -1288,12 +1114,12 @@ mod tests {
         // Match present → canonical choice.
         let ex = extractor(&["Your plan tier is Premium", "unrelated line"]);
         let r = &ex.extract(&schema()).fields[0];
-        assert_eq!(r.value.as_deref(), Some("premium"));
-        // No choice supported → null value, but the top span is still surfaced.
+        assert_eq!(r.candidates[0].value.as_deref(), Some("premium"));
+        // No choice supported → no isolated value, but the span is still surfaced.
         let ex2 = extractor(&["Your plan tier is Ultimate", "unrelated line"]);
         let r2 = &ex2.extract(&schema()).fields[0];
-        assert_eq!(r2.value, None);
         assert!(!r2.candidates.is_empty());
+        assert!(r2.candidates.iter().all(|c| c.value.is_none()));
     }
 
     #[test]
@@ -1303,8 +1129,9 @@ mod tests {
             fields: vec![field("invoice_number", "the invoice number")],
         };
         let r = &ex.extract(&schema).fields[0];
-        assert_eq!(r.value.as_deref(), Some("INV-2024-0042"));
-        // But the raw span is preserved on the candidate for verification.
+        // The candidate isolates the value via the label strip, but keeps the
+        // full span as `text` for verification.
+        assert_eq!(r.candidates[0].value.as_deref(), Some("INV-2024-0042"));
         assert_eq!(r.candidates[0].text, "Invoice Number: INV-2024-0042");
     }
 
@@ -1401,13 +1228,16 @@ mod tests {
         assert_eq!(out.records.len(), 2);
 
         let r0 = &out.records[0];
-        assert_eq!(r0.fields[0].value.as_deref(), Some("Widget"));
-        assert_eq!(r0.fields[1].value.as_deref(), Some("$9.00"));
+        assert_eq!(r0.fields[0].candidates[0].text, "Widget");
+        assert_eq!(r0.fields[1].candidates[0].text, "$9.00");
         // Row-level provenance flows onto every cell of the record.
-        assert_eq!(r0.fields[0].bbox.as_ref().map(|b| b.y), Some(680.0));
-        assert_eq!(r0.fields[1].page, Some(1));
+        assert_eq!(
+            r0.fields[0].candidates[0].bbox.as_ref().map(|b| b.y),
+            Some(680.0)
+        );
+        assert_eq!(r0.fields[1].candidates[0].page, 1);
 
-        assert_eq!(out.records[1].fields[0].value.as_deref(), Some("Gadget"));
+        assert_eq!(out.records[1].fields[0].candidates[0].text, "Gadget");
     }
 
     /// The grid that maps more sub-fields wins over an unrelated table (e.g. an
@@ -1435,8 +1265,8 @@ mod tests {
         };
         let out = ex.extract_object_array(&group, &[address, items]);
         assert_eq!(out.records.len(), 1);
-        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("Bolt"));
-        assert_eq!(out.records[0].fields[1].value.as_deref(), Some("12"));
+        assert_eq!(out.records[0].fields[0].candidates[0].text, "Bolt");
+        assert_eq!(out.records[0].fields[1].candidates[0].text, "12");
     }
 
     /// Headerless grids can't map columns → no records rather than a wrong guess.
@@ -1472,8 +1302,9 @@ mod tests {
             rows: vec![row(&["Widget", ""], 680.0)],
         };
         let out = ex.extract_object_array(&group, &[grid]);
-        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("Widget"));
-        assert_eq!(out.records[0].fields[1].value, None);
+        assert_eq!(out.records[0].fields[0].candidates[0].text, "Widget");
+        // The empty price cell is a miss — no candidate at all.
+        assert!(out.records[0].fields[1].candidates.is_empty());
     }
 
     /// A record schema that contains its own repeated group (census-style
@@ -1500,7 +1331,7 @@ mod tests {
     }
 
     /// Body rows where no mapped column has a non-empty cell would emit an
-    /// all-null record — dropped, they carry no signal at all.
+    /// all-null record — dropped, they carry nothing at all.
     #[test]
     fn object_array_drops_all_null_rows() {
         let ex = LocalExtractor::from_units(OffsetMap::default(), vec![]);
@@ -1524,7 +1355,7 @@ mod tests {
         };
         let out = ex.extract_object_array(&group, &[grid]);
         assert_eq!(out.records.len(), 1);
-        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("Widget"));
+        assert_eq!(out.records[0].fields[0].candidates[0].text, "Widget");
     }
 
     /// A body row whose resolved cells only echo their field names / column
@@ -1552,101 +1383,50 @@ mod tests {
         };
         let out = ex.extract_object_array(&group, &[grid]);
         assert_eq!(out.records.len(), 1);
-        assert_eq!(out.records[0].fields[0].value.as_deref(), Some("$405.00"));
+        assert_eq!(out.records[0].fields[0].candidates[0].text, "$405.00");
     }
 
-    /// Array signal: a lone sparse record must not read `strong`; a dense
-    /// record with a value-shaped cell must.
+    /// An implemented `format` scanner that matches nowhere never guesses — no
+    /// value is isolated on the candidate — while the retrieved span stays for
+    /// provenance. When the shape IS present, the candidate carries it.
     #[test]
-    fn array_signal_requires_density_and_shape() {
-        let strong_field = |name: &str, value: &str, signal: Signal, typed: bool| FieldResult {
-            name: name.into(),
-            value: Some(value.into()),
-            signal,
-            score: Some(1.0),
-            page: Some(1),
-            bbox: None,
-            candidates: vec![Candidate {
-                value: typed.then(|| value.to_string()),
-                text: value.into(),
-                score: 1.0,
-                page: 1,
-                bbox: None,
-                source: UnitSource::HeaderCell,
-            }],
-        };
-        // One of two sub-fields resolved, raw span: weak, not strong.
-        let sparse = Record {
-            fields: vec![
-                strong_field("a", "junk", Signal::Weak, false),
-                FieldResult::miss("b"),
-            ],
-        };
-        assert_eq!(
-            ArrayFieldResult::new("g".into(), vec![sparse.clone()]).signal,
-            Signal::Weak
-        );
-        // Both resolved, one value-shaped: strong.
-        let dense = Record {
-            fields: vec![
-                strong_field("a", "Bolt", Signal::Weak, false),
-                strong_field("b", "$9.00", Signal::Strong, true),
-            ],
-        };
-        assert_eq!(
-            ArrayFieldResult::new("g".into(), vec![sparse, dense]).signal,
-            Signal::Strong
-        );
-        // No records is an honest none.
-        assert_eq!(
-            ArrayFieldResult::new("g".into(), vec![]).signal,
-            Signal::None
-        );
-    }
-
-    /// An implemented `format` scanner that matches nowhere never guesses: the
-    /// value is null, signal `none`, while the retrieved spans stay available.
-    #[test]
-    fn format_no_match_yields_null_not_raw_span() {
-        let ex = extractor(&["Contact our sales team for email support today"]);
+    fn format_scanner_isolates_value_or_nothing() {
         let mut f = field("contact_email", "contact email support team");
         f.format = Some("email".into());
-        let out = ex.extract_field(&f);
-        assert_eq!(out.value, None);
-        assert_eq!(out.signal, Signal::None);
-        assert!(!out.candidates.is_empty(), "spans stay for provenance");
 
-        // An unimplemented format keyword imposes no such claim — raw-span
-        // fallback stands.
-        let mut g = field("contact_phone", "contact email support team");
-        g.format = Some("phone".into());
-        let out = ex.extract_field(&g);
-        assert!(out.value.is_some());
-        assert_eq!(out.signal, Signal::Weak);
+        // No email present → the candidate has a span but no isolated value.
+        let ex = extractor(&["Contact our sales team for email support today"]);
+        let out = ex.extract_field(&f);
+        assert!(!out.candidates.is_empty(), "spans stay for provenance");
+        assert!(out.candidates.iter().all(|c| c.value.is_none()));
+
+        // Email present → its address is isolated onto the candidate.
+        let ex2 = extractor(&["Email our support team at help@acme.com"]);
+        let out2 = ex2.extract_field(&f);
+        assert!(
+            out2.candidates
+                .iter()
+                .any(|c| c.value.as_deref() == Some("help@acme.com"))
+        );
     }
 
-    /// Without an embedder every candidate is lexically anchored by
-    /// construction — plain BM25 retrieval keeps its `weak` tier. (The
-    /// embed-only noise degrade is exercised e2e; it needs a model.)
+    /// A plain (untyped) field with lexical support surfaces its span as a
+    /// candidate; nothing was narrowed, so `value` stays absent.
     #[test]
-    fn bm25_candidates_stay_lexically_anchored() {
+    fn plain_field_surfaces_span_without_narrowing() {
         let ex = extractor(&["Payment terms net 30"]);
         let out = ex.extract_field(&field("terms", "payment terms"));
-        assert_eq!(out.signal, Signal::Weak);
-        assert!(out.value.is_some());
+        assert_eq!(out.candidates[0].text, "Payment terms net 30");
+        assert!(out.candidates[0].value.is_none());
     }
 
-    /// The typed-hit anchor gate is inert without an embedder: anchored typed
-    /// hits keep `strong` regardless of their (squashed-BM25) score. The
-    /// demotion side — an unanchored typed hit below the cosine floor reading
-    /// `none` — is fused-mode-only and exercised e2e (it needs a model).
+    /// A typed (money) hit isolates the amount onto the candidate's `value`.
     #[test]
-    fn anchored_typed_hit_stays_strong() {
+    fn number_field_isolates_money_value() {
         let ex = extractor(&["Total due $118.50 today"]);
         let mut f = field("total_amount", "total amount due");
         f.field_type = FieldType::Number;
         let out = ex.extract_field(&f);
-        assert_eq!(out.signal, Signal::Strong);
-        assert_eq!(out.value.as_deref(), Some("$118.50"));
+        assert_eq!(out.candidates[0].value.as_deref(), Some("$118.50"));
     }
 }

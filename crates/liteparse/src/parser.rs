@@ -212,11 +212,11 @@ impl LiteParse {
     /// **standard JSON Schema** from it — nested objects flatten to dotted
     /// names, `array<object>` groups row-group over detected tables.
     ///
-    /// The contract is **narrowing signal with provenance**, not LLM-grade
-    /// extraction: each field returns top-k candidate spans with an unitless
-    /// score, a page, a bbox, and a coarse [`Signal`](crate::extractor::Signal)
-    /// tier to branch on (act on `strong` / verify `weak` / escalate `none`).
-    /// Values are verbatim spans — normalization is deliberately out of scope.
+    /// The contract is **narrowing with provenance**, not LLM-grade extraction:
+    /// each field returns its top-k ranked candidate spans (a score, a page, a
+    /// bbox, and — when isolable — a narrowed value per candidate), not a single
+    /// asserted answer. Values are verbatim spans — normalization is
+    /// deliberately out of scope.
     ///
     /// Retrieval always fuses BM25 with a static embedding model (RRF), degrading
     /// to BM25-only when no model is available. Engine knobs live on

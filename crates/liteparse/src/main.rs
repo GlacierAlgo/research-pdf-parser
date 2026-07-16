@@ -52,16 +52,12 @@ struct ExtractSchemaCommand {
     /// (e.g. line_items) extract one record per detected table row. Field
     /// `description`s drive retrieval; `enum`/`format` sharpen the value path.
     ///
-    /// Output: one result per field with `value` (the extracted answer, or null
-    /// on no claim), `signal`, `score`, `page`, `bbox`, and `candidates`.
-    /// `signal` is the trust tier to branch on: `strong` = a typed scanner
-    /// isolated the value with lexical/cosine support; `weak` = a retrieval
-    /// match only, verify before use; `none` = no claim (spans kept for
-    /// provenance only). `candidates` are the top-k spans sorted by `score`
-    /// descending; each carries the full `text` (what to highlight) and, only
-    /// when a scanner isolated a sub-value, a narrowed `value`. The headline is
-    /// chosen by the value gate, so it need not be `candidates[0]`. `source`
-    /// tells you where a span came from: `natural_line` (a projected text line),
+    /// Output: one result per field with its `name` and ranked `candidates` —
+    /// no single "answer", since extraction is a narrowing tool. Candidates are
+    /// the top-k spans sorted by `score` descending; each carries the full
+    /// `text` (what to highlight), its `page`/`bbox`, and — only when a scanner
+    /// or label-strip isolated a sub-value — a narrowed `value`. `source` tells
+    /// you where a span came from: `natural_line` (a projected text line),
     /// `geometry_join` (label+value assembled from adjacent spans), or
     /// `header_cell` (a detected table cell; bbox may be null).
     #[arg(long)]

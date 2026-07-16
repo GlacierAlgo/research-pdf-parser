@@ -14,8 +14,8 @@
 use super::{FieldType, SchemaField};
 
 /// Try to extract a typed/format/enum value from `text` for `field`. Returns
-/// `None` when the expected shape isn't present (the caller then falls back to
-/// [`fallback_value`]). Precedence: `format` → `choices` (enum) → `type`.
+/// `None` when the expected shape isn't present ([`narrowed_value`] then decides
+/// the fallback). Precedence: `format` → `choices` (enum) → `type`.
 pub(super) fn typed_value(field: &SchemaField, text: &str) -> Option<String> {
     if let Some(fmt) = field.format.as_deref()
         && let Some(v) = match_format(fmt, text)
@@ -55,10 +55,26 @@ fn money_hint(name: &str) -> bool {
         .any(|t| MONEY.contains(&t.as_str()))
 }
 
-/// The value used when no typed scanner fired: the span trimmed of a clean
-/// `Label:` prefix when one is identifiable, else the whole trimmed span.
-pub(super) fn fallback_value(text: &str) -> String {
-    strip_label_prefix(text).to_string()
+/// The narrowed sub-value for a retrieved span, or `None` when the engine can't
+/// isolate one narrower than the full span. Present when a typed/format/enum
+/// scanner fired, or (for plain fields) when a clean `Label:` prefix strips off
+/// and leaves a shorter value. A **factual** narrowing, not a trust claim: the
+/// caller always keeps the candidate's full `text` for provenance.
+///
+/// Never-guess fields (a closed `enum`, or an implemented `format` scanner) that
+/// find no match return `None` — they do not fall back to the raw span.
+pub(super) fn narrowed_value(field: &SchemaField, text: &str) -> Option<String> {
+    if let Some(v) = typed_value(field, text) {
+        return Some(v);
+    }
+    // Enum / implemented-format fields never guess: no scanner match → no value.
+    if !field.choices.is_empty() || field.format.as_deref().is_some_and(has_format_scanner) {
+        return None;
+    }
+    // Plain fields: keep the label-stripped span only when it actually narrows.
+    let trimmed = text.trim();
+    let stripped = strip_label_prefix(trimmed);
+    (stripped != trimmed).then(|| stripped.to_string())
 }
 
 /// A `Label:` prefix is only stripped when the label side stays under both

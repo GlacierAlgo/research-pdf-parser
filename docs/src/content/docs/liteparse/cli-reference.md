@@ -207,7 +207,7 @@ lit is-complex document.pdf --compact | jq '[.[] | select(.needs_ocr) | .page_nu
 
 ## `lit extract`
 
-Pull specific fields out of a document from a JSON Schema — candidate values with scores, pages, and bounding boxes. See the [Schema Extraction guide](/liteparse/guides/schema-extraction/) for the output shape and trust signals.
+Pull specific fields out of a document from a JSON Schema — ranked candidate spans with scores, pages, and bounding boxes. See the [Schema Extraction guide](/liteparse/guides/schema-extraction/) for the output shape.
 
 ```
 lit extract [options] <file> --schema <schema>

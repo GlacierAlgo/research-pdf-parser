@@ -357,38 +357,44 @@ Nested objects flatten to dotted field names (`vendor.address.city`); an array o
 (`line_items`) extracts one record per detected table row. Field `description`s drive
 retrieval; `enum`/`format` (`email`/`uri`/`date`) sharpen the extracted value.
 
-Each field in the output carries:
+Each field reports its `name` and a ranked list of `candidates` — deliberately **not** a
+single "answer", since extraction is a narrowing tool. Each candidate carries:
 
-- **`value`** — the extracted answer, or `null` when the engine makes no claim.
-- **`signal`** — the trust tier to branch on: `strong` (a typed scanner isolated the value
-  with lexical/cosine support), `weak` (a retrieval match only — verify before use), or
-  `none` (no claim; spans kept for provenance only).
-- **`score`** / **`page`** / **`bbox`** — relevance of the headline span and where it is.
-- **`candidates`** — the top-k spans, sorted by `score` descending. Each has the full span
-  `text` (what you'd highlight), a narrowed `value` only when a scanner isolated a
-  sub-value, and a `source`: `natural_line` (a projected text line), `geometry_join`
-  (label+value assembled from adjacent spans), or `header_cell` (a detected table cell).
+- **`text`** — the full source span (what you'd highlight for a citation).
+- **`value`** — the narrowed sub-value, present **only** when a scanner or a label-strip
+  actually isolated one out of `text` (e.g. `"INV-2024-0042"` out of
+  `"Invoice Number: INV-2024-0042"`). Absent when nothing narrower than `text` was found.
+- **`score`** — relevance in `[0, 1]` (embedding cosine, or a squashed keyword score in
+  BM25-only mode). Candidates are sorted by `score` descending. A ranking aid, not a
+  probability.
+- **`page`** / **`bbox`** — where the span lives.
+- **`source`** — `natural_line` (a projected text line), `geometry_join` (label+value
+  assembled from adjacent spans), or `header_cell` (a detected table cell).
 
 ```json
 {
   "fields": [
     {
       "name": "invoice_number",
-      "value": "INV-2024-0042",
-      "signal": "strong",
-      "score": 0.71,
-      "page": 0,
-      "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
       "candidates": [
-        { "text": "Invoice Number: INV-2024-0042", "value": "INV-2024-0042",
-          "score": 0.71, "page": 0, "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
-          "source": "natural_line" }
+        {
+          "text": "Invoice Number: INV-2024-0042",
+          "value": "INV-2024-0042",
+          "score": 0.71,
+          "page": 0,
+          "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
+          "source": "natural_line"
+        }
       ]
     }
   ],
   "arrays": []
 }
 ```
+
+Your code decides what to do with the candidates: take the top one, keep those above a
+score threshold, show them to a reviewer, or feed them to an LLM. The tool narrows the
+search — it doesn't assert a single answer.
 
 Retrieval fuses BM25 with a static embedding model (`minishlab/potion-retrieval-32M`,
 ~250 MB). The model is resolved local-first (explicit `--model-path`,

@@ -6,10 +6,9 @@ sidebar:
 ---
 
 `lit extract` pulls specific fields out of a document given a JSON Schema. For each
-field it returns candidate spans with a relevance **score**, a **page**, and a
-**bounding box**, plus a coarse **trust signal** — a *narrowing signal with
-provenance*, not an LLM-grade single answer. It runs entirely locally, with no API
-keys and no LLM.
+field it returns ranked candidate spans, each with a relevance **score**, a **page**,
+and a **bounding box** — *narrowing with provenance*, not an LLM-grade single answer.
+It runs entirely locally, with no API keys and no LLM.
 
 ## What it's good for
 
@@ -63,11 +62,6 @@ candidate spans behind it:
   "fields": [
     {
       "name": "invoice_number",
-      "value": "INV-2024-0042",
-      "signal": "strong",
-      "score": 0.71,
-      "page": 0,
-      "bbox": { "x": 72.0, "y": 96.4, "width": 180.0, "height": 12.0 },
       "candidates": [
         {
           "text": "Invoice Number: INV-2024-0042",
@@ -84,33 +78,21 @@ candidate spans behind it:
 }
 ```
 
+Each field reports its `name` and a ranked list of `candidates` — deliberately **not** a
+single "answer", because the tool narrows the search rather than asserting a result. Each
+candidate carries:
+
 | Field | Meaning |
 |-------|---------|
-| `value` | The extracted answer, or `null` when the engine makes no claim. |
-| `signal` | The trust tier to branch on (see below). |
-| `score` | Relevance of the headline span in `[0, 1]` — embedding cosine, or a squashed keyword score in BM25-only mode. A ranking aid, **not** a probability. |
-| `page` / `bbox` | Where the headline span lives. |
-| `candidates` | Top-k spans, sorted by `score` descending. |
+| `text` | The full source span — what you'd highlight for a citation. |
+| `value` | The narrowed sub-value, present **only** when a scanner or a label-strip isolated one out of `text` (e.g. `"INV-2024-0042"` out of `"Invoice Number: INV-2024-0042"`). Absent when nothing narrower than `text` was found. |
+| `score` | Relevance in `[0, 1]` — embedding cosine, or a squashed keyword score in BM25-only mode. Candidates are sorted by `score` descending. A ranking aid, **not** a probability. |
+| `page` / `bbox` | Where the span lives. |
+| `source` | `natural_line` (a projected line of text), `geometry_join` (a label and value assembled from adjacent spans), or `header_cell` (a detected table cell — its `bbox` may be `null`). |
 
-Each **candidate** carries the full span `text` (what you'd highlight), a narrowed
-`value` **only** when a scanner isolated a sub-value out of that span, and a `source`:
-
-- `natural_line` — a projected line of text.
-- `geometry_join` — a label and value assembled from spatially adjacent spans.
-- `header_cell` — a detected table cell (its `bbox` may be `null`).
-
-### Trust signals
-
-Branch on `signal` rather than the raw score:
-
-| Signal | Meaning | What to do |
-|--------|---------|------------|
-| `strong` | A typed scanner isolated the value, with lexical or cosine support. | Act on it. |
-| `weak` | A retrieval match only — no value shape was isolated. | Verify before using. |
-| `none` | No claim. The spans are kept in `candidates` for provenance only. | Escalate or skip. |
-
-The headline is chosen by the value gate, so it is **not** necessarily
-`candidates[0]` — the first candidate is simply the highest-scoring span.
+Your code decides what to do with the candidates: take the top one (they're sorted by
+`score`), keep those above a threshold, show them to a reviewer, or feed them to an LLM.
+Because there's no single "answer" field, the output never overstates a guess as a result.
 
 ## Nested objects and tables
 

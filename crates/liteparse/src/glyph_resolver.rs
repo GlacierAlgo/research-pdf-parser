@@ -2,7 +2,7 @@
 //!
 //! liteparse's built-in recovery for fonts with missing/garbage `/ToUnicode`
 //! (PostScript glyph-name → Adobe Glyph List, then the embedded font program's
-//! reverse cmap; see [`crate::extract`]) is deterministic but cannot decode
+//! reverse cmap; see [`crate::pdf_read`]) is deterministic but cannot decode
 //! buggy/obfuscated fonts whose glyph names and cmap are also junk. A
 //! [`GlyphResolver`] lets a caller plug in a richer recovery strategy — e.g. a
 //! glyph-outline → unicode database — without liteparse taking on that
