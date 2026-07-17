@@ -8,7 +8,6 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -18,12 +17,9 @@ from liteparse import LiteParse
 
 from .formula_dispatch import FormulaDispatchError, FormulaProcessorRegistry
 from .markdown_cleanup import (
-    clean_extraction_markers,
     compact_markdown_blank_lines,
     normalize_table_of_contents,
-    prefer_table_of_contents,
 )
-from .mineru_remote import RemoteMineruConfig, RemoteMineruError, convert_pdf_on_dgx
 
 MATH_FONTS = ("symbol", "math", "cambria", "stix", "times new roman,italic")
 MATH_CHARS = set("=+-*/<>^_{}[]()|→←±×÷≤≥≠≈∑∫√∞σμλαβγδεθρπωΣΠ")
@@ -2118,166 +2114,6 @@ def parse_final(
     click.echo(f"final markdown: {output}")
     click.echo(f"filled formula placeholders: {replaced_count}/{result['formula_count']}")
     click.echo(f"benchmark report: {result['report_path']}")
-
-
-@cli.command("parse-cpu")
-@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "-o",
-    "output",
-    type=click.Path(dir_okay=False, path_type=Path),
-    required=True,
-    help="CPU 混合解析生成的 Markdown。",
-)
-@click.option("--pages", help="1-indexed page selection such as '1,4-5'.")
-@click.option("--model", default="PP-FormulaNet_plus-M", show_default=True, help="PaddleOCR 公式识别模型。")
-@click.option("--batch-size", type=click.IntRange(min=1), default=4, show_default=True)
-@click.option("--render-scale", type=click.FloatRange(min=1.0), default=4.0, show_default=True)
-@click.option(
-    "--formula-device",
-    type=click.Choice(["cpu", "dgx"]),
-    default="cpu",
-    show_default=True,
-    help="公式模型运行位置；DGX 使用 SSH 上的 MinerU UniMERNet CUDA。",
-)
-@click.option("--dgx-host", default="dgx-aliyun", show_default=True)
-@click.option(
-    "--no-formula-model",
-    is_flag=True,
-    help="只测试 LiteParse CPU 探针；复杂公式全部使用局部矢量裁剪回退。",
-)
-def parse_cpu(
-    pdf: Path,
-    output: Path,
-    pages: str | None,
-    model: str,
-    batch_size: int,
-    render_scale: float,
-    formula_device: str,
-    dgx_host: str,
-    no_formula_model: bool,
-) -> None:
-    """Parse a native-vector PDF and inject validated formulas into LiteParse Grid."""
-    from .cpu_hybrid import parse_cpu_hybrid
-
-    try:
-        result = parse_cpu_hybrid(
-            pdf,
-            output,
-            pages=pages,
-            model_name=model,
-            batch_size=batch_size,
-            render_scale=render_scale,
-            run_model=not no_formula_model,
-            formula_device=formula_device,
-            dgx_host=dgx_host,
-        )
-    except (RuntimeError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    click.echo(f"markdown: {result.markdown_path}")
-    click.echo(f"report: {result.report_path}")
-    click.echo(f"manifest: {result.manifest_path}")
-    click.echo(
-        "LiteParse={:.3f}s, final Grid={:.3f}s, model init={:.3f}s, inference={:.3f}s; "
-        "native={}, vision={}, latex={}, fallback={}".format(
-            result.parse_seconds,
-            result.reproject_seconds,
-            result.model_init_seconds,
-            result.model_inference_seconds,
-            result.native_count,
-            result.vision_count,
-            result.accepted_latex_count,
-            result.fallback_image_count,
-        )
-    )
-    if result.skipped_pages:
-        click.echo(f"skipped scanned pages: {result.skipped_pages}", err=True)
-
-
-@cli.command("parse-best")
-@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "-o",
-    "output",
-    type=click.Path(dir_okay=False, path_type=Path),
-    required=True,
-    help="Final Markdown output path.",
-)
-@click.option(
-    "--dgx-host",
-    default="dgx-aliyun",
-    envvar="RESEARCH_PDF_PARSER_DGX_HOST",
-    show_default=True,
-    help="SSH host used for the DGX MinerU worker.",
-)
-@click.option(
-    "--remote-uvx",
-    default="~/.local/bin/uvx",
-    envvar="RESEARCH_PDF_PARSER_DGX_UVX",
-    show_default=True,
-    help="uvx executable on the DGX worker.",
-)
-@click.option(
-    "--backend",
-    type=click.Choice(["hybrid-engine", "pipeline"]),
-    default="hybrid-engine",
-    show_default=True,
-    help="MinerU backend. hybrid-engine is the high-accuracy default.",
-)
-@click.option(
-    "--effort",
-    type=click.Choice(["low", "medium", "high"]),
-    default="high",
-    show_default=True,
-    help="MinerU VLM effort for the hybrid backend.",
-)
-@click.option("--keep-remote", is_flag=True, help="Keep the remote run directory for debugging.")
-def parse_best(
-    pdf: Path,
-    output: Path,
-    dgx_host: str,
-    remote_uvx: str,
-    backend: str,
-    effort: str,
-    keep_remote: bool,
-) -> None:
-    """Run the high-accuracy MinerU path on DGX and package local Markdown."""
-    config = RemoteMineruConfig(
-        host=dgx_host,
-        uvx_path=remote_uvx,
-        backend=backend,
-        effort=effort,
-        keep_remote=keep_remote,
-    )
-    try:
-        with TemporaryDirectory(prefix="research-pdf-parser-mineru-") as directory:
-            raw_markdown_path = convert_pdf_on_dgx(pdf, Path(directory), config)
-            markdown = clean_extraction_markers(raw_markdown_path.read_text(encoding="utf-8"))
-
-            with pymupdf.open(pdf) as document:
-                has_toc_candidate_page = document.page_count >= 2
-            if has_toc_candidate_page:
-                try:
-                    toc_pages, _ = liteparse_page_markdown(pdf, "2")
-                    reference_toc = toc_pages.get(2, "")
-                    if reference_toc:
-                        markdown = prefer_table_of_contents(markdown, reference_toc)
-                except Exception as exc:  # TOC repair is an optional secondary parser pass.
-                    click.echo(f"warning: vector TOC repair skipped: {exc}", err=True)
-
-            markdown = compact_markdown_blank_lines(normalize_table_of_contents(markdown))
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(
-                rebundle_markdown_images(markdown, raw_markdown_path, output),
-                encoding="utf-8",
-            )
-    except RemoteMineruError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    click.echo(f"final markdown: {output}")
-    click.echo(f"backend: MinerU {backend} ({effort}) on {dgx_host}")
-    click.echo(f"assets: {markdown_assets_dir(output)}")
 
 
 def main() -> None:

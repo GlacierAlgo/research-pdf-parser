@@ -6,7 +6,7 @@
 > reports; scanned PDFs are logged and skipped. See
 > [RESEARCH_FORK.md](RESEARCH_FORK.md) for the maintained fork boundary and
 > [`packages/research-pdf-parser`](packages/research-pdf-parser) for the public
-> `auto`/CPU/DGX interface.
+> `auto`/CPU/GPU-capability interface.
 
 > **OCR boundary:** the upstream LiteParse documentation retained below covers
 > builds compiled with the optional Tesseract feature. This fork's Python wheel

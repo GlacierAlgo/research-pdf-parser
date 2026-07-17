@@ -19,8 +19,9 @@ calculation, and reproduction validation. It must not execute OCR LaTeX as truth
 
 `shadow-local-agents` owns parser execution and adapts `ParseResult` into the
 existing Lighthouse writeback contract. Lightweight workers consume
-`native-fast`; formula workers consume `formula-cpu`; DGX workers lease only
-explicit complex jobs.
+`native-fast`; formula workers consume `formula-cpu` and advertise CPU/GPU or
+`/formula_ocr` service capability. Remote GPU workers lease only explicit
+complex jobs; no hostname or machine product class is part of the contract.
 
 `shadow-lighthouse` owns leases, idempotent result writeback, durable evidence,
 indexes, quality/review state, and read APIs. It does not import this parser or

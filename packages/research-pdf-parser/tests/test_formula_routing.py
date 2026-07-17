@@ -12,8 +12,6 @@ from research_pdf_parser.legacy_pipeline import (
     TextChar,
     apply_formula_ocr,
     attach_best_results_to_records,
-    clean_extraction_markers,
-    compact_markdown_blank_lines,
     fill_formula_placeholders,
     formula_confidence,
     group_preview_text,
@@ -26,9 +24,7 @@ from research_pdf_parser.legacy_pipeline import (
     materialize_markdown_images,
     normalize_formula_crop_image,
     normalize_private_use_text,
-    normalize_table_of_contents,
     parse_smart,
-    prefer_table_of_contents,
     read_formula_manifest,
     rebundle_markdown_images,
     resolve_page_indexes,
@@ -36,6 +32,12 @@ from research_pdf_parser.legacy_pipeline import (
     should_externalize_formula,
     summarize_benchmark_results,
     write_formula_manifest_records,
+)
+from research_pdf_parser.markdown_cleanup import (
+    clean_extraction_markers,
+    compact_markdown_blank_lines,
+    normalize_table_of_contents,
+    prefer_table_of_contents,
 )
 
 ROOT = Path(__file__).resolve().parents[1]

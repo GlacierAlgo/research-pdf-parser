@@ -11,14 +11,15 @@ This matrix is the maintained answer to “what is actually connected?”
 | Markdown-table formula detection | `formula-cpu` | LiteParse probe/table recovery | production |
 | Local vector crop rendering | `formula-cpu` | PyMuPDF | production |
 | PP-FormulaNet S then M fallback | `formula-cpu` | `formula_runtime.py` | production when optional extra is installed |
-| Persistent batch formula service | `serve formula-cpu` | `formula_service.py` | production on trusted network |
+| Local GPU capability detection | `--formula-device auto`, `doctor` | `accelerator.py` | production; CPU fallback |
+| LiteParse-style formula HTTP client | `--formula-server-url http://IP/formula_ocr` | `formula_service.py` | production; machine-neutral |
+| Reference formula service | `serve formula` | `formula_service.py` | production on trusted network |
 | Candidate structural validation | `formula-cpu` | `cpu_hybrid.py` | production |
 | Pre-Grid `FormulaAtom` injection | Python API used by `formula-cpu` | patched LiteParse Rust/PyO3 | production |
 | Pure Markdown pipe tables | all LiteParse profiles | `markdown_layout/tables.rs` | production; no HTML rowspan |
 | Vector-image formula fallback | `formula-cpu --no-formula-model` or failed validation | `cpu_hybrid.py` | production |
-| Optional DGX formula candidate source | `formula-cpu --formula-device dgx` | UniMERNet over SSH | optional |
-| Full-document high-accuracy DGX path | `formula-best` | MinerU hybrid high | optional, explicit only |
-| SSH timeout/keepalive/transient retry | DGX paths and `doctor --check-dgx` | `mineru_remote.py` | production |
+| Full-document remote GPU path | `formula-best --gpu-host HOST` | MinerU hybrid high | optional, explicit only; GPU preflight |
+| SSH timeout/keepalive/transient retry | `formula-best`, `doctor --gpu-host` | `mineru_remote.py` | production |
 | Canonical Markdown cleanup | all production profiles | `markdown_cleanup.py` | production |
 | One-Markdown default | `auto`, `native-fast` | facade/CLI | production |
 | Sparse typed-block result | `ParseResult`, `--result-json` | `contracts.py` | production |

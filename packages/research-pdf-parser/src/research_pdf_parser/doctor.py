@@ -1,4 +1,4 @@
-"""Runtime capability checks for local and optional DGX profiles."""
+"""Runtime capability checks for local and optional GPU profiles."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ import pymupdf
 from liteparse import FormulaAtom, LiteParse
 from liteparse import __version__ as liteparse_version
 
+from .accelerator import detect_local_gpu, resolve_formula_device
 from .formula_service import formula_service_health
-from .mineru_remote import RemoteMineruConfig, check_dgx_connection
+from .mineru_remote import RemoteMineruConfig, check_remote_gpu_connection
 
 
 @dataclass(frozen=True)
@@ -24,11 +25,12 @@ class Capability:
 
 def inspect_capabilities(
     *,
-    check_dgx: bool = False,
-    dgx_host: str = "dgx-aliyun",
+    gpu_host: str | None = None,
     remote_uvx: str = "~/.local/bin/uvx",
     formula_server_url: str | None = None,
 ) -> list[Capability]:
+    paddle_available = importlib.util.find_spec("paddleocr") is not None
+    local_gpu = detect_local_gpu()
     capabilities = [
         Capability(
             "liteparse-formula-atom",
@@ -45,16 +47,23 @@ def inspect_capabilities(
         ),
         Capability(
             "formula-cpu",
-            importlib.util.find_spec("paddleocr") is not None,
-            "PaddleOCR installed" if importlib.util.find_spec("paddleocr") else "install the formula-cpu extra",
+            paddle_available,
+            "PaddleOCR installed" if paddle_available else "install the formula-cpu extra",
         ),
         Capability(
-            "ssh",
-            shutil.which("ssh") is not None and shutil.which("scp") is not None,
-            "ssh and scp found" if shutil.which("ssh") and shutil.which("scp") else "ssh/scp missing",
-            required=check_dgx,
+            "local-gpu",
+            local_gpu.available,
+            local_gpu.detail,
         ),
     ]
+    if paddle_available:
+        capabilities.append(
+            Capability(
+                "formula-device",
+                True,
+                f"auto resolves to {resolve_formula_device('auto')}",
+            )
+        )
     if formula_server_url:
         try:
             health = formula_service_health(formula_server_url)
@@ -62,14 +71,25 @@ def inspect_capabilities(
             capabilities.append(Capability("formula-service", True, detail))
         except RuntimeError as exc:
             capabilities.append(Capability("formula-service", False, str(exc)))
-    if check_dgx:
+    if gpu_host:
+        ssh_available = shutil.which("ssh") is not None and shutil.which("scp") is not None
+        capabilities.append(
+            Capability(
+                "ssh",
+                ssh_available,
+                "ssh and scp found" if ssh_available else "ssh/scp missing",
+                required=True,
+            )
+        )
         try:
-            detail = check_dgx_connection(RemoteMineruConfig(host=dgx_host, uvx_path=remote_uvx))
-            available = "uvx=ok" in detail
+            detail = check_remote_gpu_connection(
+                RemoteMineruConfig(host=gpu_host, uvx_path=remote_uvx)
+            )
+            available = "uvx=ok" in detail and "gpu=missing" not in detail
         except RuntimeError as exc:
             available = False
             detail = str(exc)
-        capabilities.append(Capability("dgx", available, detail, required=True))
+        capabilities.append(Capability("remote-gpu-worker", available, detail, required=True))
     return capabilities
 
 

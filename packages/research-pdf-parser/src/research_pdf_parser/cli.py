@@ -72,6 +72,13 @@ def parse_group() -> None:
 @click.option("--model", default="PP-FormulaNet_plus-S", show_default=True)
 @click.option("--fallback-model", default="PP-FormulaNet_plus-M", show_default=True)
 @click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
+@click.option(
+    "--formula-device",
+    type=click.Choice(["auto", "cpu", "gpu"]),
+    default="auto",
+    show_default=True,
+    help="Auto uses a local Paddle GPU when available, otherwise CPU.",
+)
 @click.option("--batch-size", type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
 def parse_auto(
@@ -83,10 +90,11 @@ def parse_auto(
     model: str,
     fallback_model: str,
     formula_server_url: str | None,
+    formula_device: str,
     batch_size: int,
     result_json: Path | None,
 ) -> None:
-    """Probe once; choose native-fast or formula-cpu, never DGX."""
+    """Probe once; choose native-fast or formula-cpu, never a remote worker."""
     result = _parse_with_errors(
         pdf_path=pdf,
         output_path=output,
@@ -97,6 +105,7 @@ def parse_auto(
         formula_model=model,
         fallback_formula_model=fallback_model or None,
         formula_server_url=formula_server_url,
+        formula_device=formula_device,
         batch_size=batch_size,
     )
     _echo_result(result)
@@ -138,13 +147,16 @@ def native_fast(pdf: Path, output: Path, pages: str | None, images: str, result_
 @click.option("--render-scale", type=click.FloatRange(min=1.0), default=4.0, show_default=True)
 @click.option(
     "--formula-device",
-    type=click.Choice(["cpu", "dgx"]),
-    default="cpu",
+    type=click.Choice(["auto", "cpu", "gpu"]),
+    default="auto",
     show_default=True,
-    help="DGX changes only the formula candidate source; validation and final Grid stay local.",
+    help="Auto uses a local Paddle GPU when available, otherwise CPU.",
 )
-@click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
-@click.option("--dgx-host", default="dgx-aliyun", show_default=True)
+@click.option(
+    "--formula-server-url",
+    envvar="RESEARCH_PDF_PARSER_FORMULA_URL",
+    help="LiteParse-style endpoint such as http://10.0.0.8/formula_ocr.",
+)
 @click.option("--no-formula-model", is_flag=True, help="Use crisp vector crops for every visual formula.")
 @click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
 def formula_cpu(
@@ -157,7 +169,6 @@ def formula_cpu(
     render_scale: float,
     formula_device: str,
     formula_server_url: str | None,
-    dgx_host: str,
     no_formula_model: bool,
     result_json: Path | None,
 ) -> None:
@@ -174,7 +185,6 @@ def formula_cpu(
         formula_device=formula_device,
         batch_size=batch_size,
         render_scale=render_scale,
-        dgx_config=RemoteMineruConfig(host=dgx_host),
     )
     _echo_result(result)
     _write_optional_result(result, result_json)
@@ -183,8 +193,18 @@ def formula_cpu(
 @parse_group.command("formula-best")
 @click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("-o", "output", required=True, type=click.Path(dir_okay=False, path_type=Path))
-@click.option("--dgx-host", default="dgx-aliyun", envvar="RESEARCH_PDF_PARSER_DGX_HOST", show_default=True)
-@click.option("--remote-uvx", default="~/.local/bin/uvx", envvar="RESEARCH_PDF_PARSER_DGX_UVX", show_default=True)
+@click.option(
+    "--gpu-host",
+    required=True,
+    envvar="RESEARCH_PDF_PARSER_GPU_HOST",
+    help="Explicit SSH host for a remote GPU worker; no machine is assumed.",
+)
+@click.option(
+    "--remote-uvx",
+    default="~/.local/bin/uvx",
+    envvar="RESEARCH_PDF_PARSER_REMOTE_UVX",
+    show_default=True,
+)
 @click.option("--backend", type=click.Choice(["hybrid-engine", "pipeline"]), default="hybrid-engine")
 @click.option("--effort", type=click.Choice(["low", "medium", "high"]), default="high")
 @click.option("--keep-remote", is_flag=True)
@@ -192,20 +212,20 @@ def formula_cpu(
 def formula_best(
     pdf: Path,
     output: Path,
-    dgx_host: str,
+    gpu_host: str,
     remote_uvx: str,
     backend: str,
     effort: str,
     keep_remote: bool,
     result_json: Path | None,
 ) -> None:
-    """Explicit MinerU high-accuracy path on DGX; auto never selects it."""
+    """Explicit MinerU high-accuracy path on a detected remote GPU."""
     result = _parse_with_errors(
         pdf_path=pdf,
         output_path=output,
         profile="formula-best",
-        dgx_config=RemoteMineruConfig(
-            host=dgx_host,
+        gpu_config=RemoteMineruConfig(
+            host=gpu_host,
             uvx_path=remote_uvx,
             backend=backend,
             effort=effort,
@@ -245,24 +265,25 @@ def probe_command(pdf: Path, pages: str | None, json_output: bool) -> None:
 
 
 @cli.command("doctor")
-@click.option("--check-dgx", is_flag=True, help="Verify SSH and the configured remote uvx.")
-@click.option("--dgx-host", default="dgx-aliyun", show_default=True)
+@click.option(
+    "--gpu-host",
+    envvar="RESEARCH_PDF_PARSER_GPU_HOST",
+    help="Optionally verify an explicit SSH GPU worker for formula-best.",
+)
 @click.option("--remote-uvx", default="~/.local/bin/uvx", show_default=True)
 @click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
 @click.option("--json-output", is_flag=True)
 @click.option("--strict", is_flag=True)
 def doctor(
-    check_dgx: bool,
-    dgx_host: str,
+    gpu_host: str | None,
     remote_uvx: str,
     formula_server_url: str | None,
     json_output: bool,
     strict: bool,
 ) -> None:
-    """Show required local and optional model/DGX capabilities."""
+    """Detect local formula hardware and optional remote GPU capabilities."""
     capabilities = inspect_capabilities(
-        check_dgx=check_dgx,
-        dgx_host=dgx_host,
+        gpu_host=gpu_host,
         remote_uvx=remote_uvx,
         formula_server_url=formula_server_url,
     )
@@ -282,15 +303,21 @@ def serve_group() -> None:
     """Run optional persistent inference services."""
 
 
-@serve_group.command("formula-cpu")
+@serve_group.command("formula")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", type=click.IntRange(min=1, max=65535), default=8765, show_default=True)
 @click.option("--model", default="PP-FormulaNet_plus-S", show_default=True)
-def serve_formula_cpu(host: str, port: int, model: str) -> None:
-    """Load PP-FormulaNet once and serve trusted-network batch requests."""
-    click.echo(f"loading {model} on cpu; listening at http://{host}:{port}")
+@click.option(
+    "--device",
+    type=click.Choice(["auto", "cpu", "gpu"]),
+    default="auto",
+    show_default=True,
+)
+def serve_formula(host: str, port: int, model: str, device: str) -> None:
+    """Serve a LiteParse-style /formula_ocr endpoint."""
+    click.echo(f"loading {model} on {device}; endpoint http://{host}:{port}/formula_ocr")
     try:
-        serve_formula_runtime(host=host, port=port, model_name=model)
+        serve_formula_runtime(host=host, port=port, model_name=model, device=device)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
 

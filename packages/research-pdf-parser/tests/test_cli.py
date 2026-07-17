@@ -21,8 +21,18 @@ class CliTests(unittest.TestCase):
         self.assertIn("├─ formula-cpu", result.output)
         self.assertIn("└─ formula-best", result.output)
         self.assertIn("● serve", result.output)
+        self.assertIn("└─ formula", result.output)
         self.assertIn("● experiment", result.output)
         self.assertIn("├─ legacy-placeholders", result.output)
+        self.assertNotIn("DGX", result.output)
+
+    def test_formula_profile_exposes_device_detection_and_http_endpoint(self) -> None:
+        result = CliRunner().invoke(cli, ["parse", "formula-cpu", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("[auto|cpu|gpu]", result.output)
+        self.assertIn("http://10.0.0.8/formula_ocr", result.output)
+        self.assertNotIn("--dgx-host", result.output)
 
     def test_doctor_reports_patched_liteparse(self) -> None:
         result = CliRunner().invoke(cli, ["doctor", "--json-output", "--strict"])
@@ -31,6 +41,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(result.output)
         liteparse = next(item for item in payload if item["name"] == "liteparse-formula-atom")
         self.assertTrue(liteparse["available"])
+        self.assertTrue(any(item["name"] == "local-gpu" for item in payload))
 
     def test_native_fast_writes_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

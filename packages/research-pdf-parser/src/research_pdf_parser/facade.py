@@ -1,4 +1,4 @@
-"""One public parse entry point across fast, CPU-formula, and DGX profiles."""
+"""One public parse entry point across fast, formula, and optional GPU profiles."""
 
 from __future__ import annotations
 
@@ -40,16 +40,17 @@ def parse_pdf(
     formula_model: str = "PP-FormulaNet_plus-S",
     fallback_formula_model: str | None = "PP-FormulaNet_plus-M",
     formula_server_url: str | None = None,
-    formula_device: str = "cpu",
+    formula_device: str = "auto",
     batch_size: int = 4,
     render_scale: float = 4.0,
-    dgx_config: RemoteMineruConfig | None = None,
+    gpu_config: RemoteMineruConfig | None = None,
 ) -> ParseResult:
     """Parse one native-vector PDF and return the neutral v1 result contract.
 
-    ``auto`` never selects DGX. It uses the OCR-free probe to choose either
+    ``auto`` never selects a remote worker. It uses the OCR-free probe to choose either
     ``native-fast``, ``formula-cpu``, or the observable ``scanned-deferred``
-    route. Only an explicit ``formula-best`` request can use the remote worker.
+    route. Local formula inference detects a usable GPU and otherwise runs on
+    CPU. Only an explicit ``formula-best`` request can use a remote GPU worker.
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
     if profile not in PROFILES:
@@ -91,8 +92,13 @@ def parse_pdf(
         available = formula_model_available()
         should_run_model = run_formula_model
         if should_run_model is None:
-            should_run_model = bool(formula_server_url or formula_device == "dgx" or available)
-        if should_run_model and formula_device == "cpu" and not formula_server_url and not available:
+            should_run_model = bool(formula_server_url or available)
+        if (
+            should_run_model
+            and formula_device in {"auto", "cpu", "gpu"}
+            and not formula_server_url
+            and not available
+        ):
             raise RuntimeError(
                 "formula-cpu was required but PP-FormulaNet is not installed; "
                 "run `uv sync --extra formula-cpu`, configure --formula-server-url, "
@@ -110,7 +116,6 @@ def parse_pdf(
             render_scale=render_scale,
             run_model=should_run_model,
             formula_device=formula_device,
-            dgx_host=(dgx_config.host if dgx_config else "dgx-aliyun"),
             formula_server_url=formula_server_url,
         )
         timings.update(
@@ -132,7 +137,9 @@ def parse_pdf(
     elif actual == "formula-best":
         if pages:
             raise ValueError("formula-best currently processes the complete PDF; --pages is not supported")
-        high = parse_best_pdf(pdf_path, output_path, config=dgx_config)
+        if gpu_config is None:
+            raise ValueError("formula-best requires an explicit remote GPU host")
+        high = parse_best_pdf(pdf_path, output_path, config=gpu_config)
         timings["formula_best"] = high.elapsed_seconds
         if high.assets_dir.exists():
             artifacts["assets"] = str(high.assets_dir)

@@ -14,7 +14,7 @@ class RemoteMineruError(RuntimeError):
 
 @dataclass(frozen=True)
 class RemoteMineruConfig:
-    host: str = "dgx-aliyun"
+    host: str
     uvx_path: str = "~/.local/bin/uvx"
     backend: str = "hybrid-engine"
     effort: str = "high"
@@ -93,8 +93,8 @@ def scp_command(config: RemoteMineruConfig, *paths: str) -> list[str]:
     return ["scp", *ssh_options(config), *paths]
 
 
-def check_dgx_connection(config: RemoteMineruConfig) -> str:
-    """Verify SSH plus the configured uvx path without starting a model."""
+def check_remote_gpu_connection(config: RemoteMineruConfig) -> str:
+    """Verify SSH, a visible NVIDIA GPU, and the configured uvx path."""
     _validate_host(config.host)
     uvx_check = (
         f'"$HOME"/{shlex.quote(config.uvx_path[2:])}'
@@ -105,7 +105,11 @@ def check_dgx_connection(config: RemoteMineruConfig) -> str:
         ssh_command(
             config,
             'printf "home=%s\\n" "$HOME"; '
-            f"test -x {uvx_check} && printf 'uvx=ok\\n' || printf 'uvx=missing\\n'",
+            f"test -x {uvx_check} && printf 'uvx=ok\\n' || printf 'uvx=missing\\n'; "
+            "if command -v nvidia-smi >/dev/null 2>&1; then "
+            "gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1); "
+            "test -n \"$gpu_name\" && printf 'gpu=%s\\n' \"$gpu_name\" || printf 'gpu=missing\\n'; "
+            "else printf 'gpu=missing\\n'; fi",
         ),
         capture_output=True,
         attempts=config.transport_attempts,
@@ -173,13 +177,18 @@ def find_mineru_markdown(output_dir: Path) -> Path:
     return candidates[0]
 
 
-def convert_pdf_on_dgx(
+def convert_pdf_on_remote_gpu(
     pdf_path: Path,
     destination_dir: Path,
     config: RemoteMineruConfig,
 ) -> Path:
-    """Run MinerU through SSH and return the downloaded raw Markdown path."""
+    """Run MinerU on an explicitly configured GPU host over SSH."""
     _validate_host(config.host)
+    capability = check_remote_gpu_connection(config)
+    if "uvx=ok" not in capability:
+        raise RemoteMineruError(f"Remote worker is missing uvx: {config.host}")
+    if "gpu=missing" in capability:
+        raise RemoteMineruError(f"Remote worker has no detectable NVIDIA GPU: {config.host}")
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     home_result = _run(

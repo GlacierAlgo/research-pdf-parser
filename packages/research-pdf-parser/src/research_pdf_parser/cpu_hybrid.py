@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -28,7 +27,6 @@ from .assets import materialize_liteparse_images
 from .formula_runtime import PaddleFormulaRuntime
 from .formula_service import recognize_formula_files
 from .markdown_cleanup import normalize_markdown
-from .mineru_remote import RemoteMineruConfig, _run, scp_command, ssh_command
 from .pdf_utils import (
     normalize_private_use,
     resolve_page_numbers,
@@ -58,41 +56,6 @@ IMPORTANT_IDENTIFIERS = (
 )
 NOISE_RE = re.compile(r"数量化专题报告|请务必阅读正文之后|\b\d+\s+of\s+\d+\b")
 HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)+\.?\s+|\d+\.\s+|附录\s*\d*)")
-DGX_FORMULA_RUNNER = r"""
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-import cv2
-
-from mineru.model.mfr.unimernet.Unimernet import UnimernetModel
-from mineru.utils.enum_class import ModelPath
-from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
-
-input_dir = Path(sys.argv[1])
-files = sorted(input_dir.glob("*.png"))
-relative = ModelPath.unimernet_small
-root = auto_download_and_get_model_root_path(relative)
-start = time.perf_counter()
-model = UnimernetModel(os.path.join(root, relative), "cuda")
-init_seconds = time.perf_counter() - start
-images = [cv2.imread(str(path)) for path in files]
-if any(image is None for image in images):
-    raise RuntimeError("failed to read one or more formula crops")
-detections = [
-    [{"bbox": [0, 0, image.shape[1], image.shape[0]], "label": "display_formula"}]
-    for image in images
-]
-start = time.perf_counter()
-results = model.batch_predict(detections, images, batch_size=int(sys.argv[2]))
-inference_seconds = time.perf_counter() - start
-print(json.dumps({"_meta": {"init_seconds": init_seconds, "inference_seconds": inference_seconds}}))
-for path, result in zip(files, results):
-    latex = result[0].get("latex", "") if result else ""
-    print(json.dumps({"id": path.stem, "latex": latex}, ensure_ascii=False))
-"""
 
 
 @dataclass
@@ -339,6 +302,7 @@ def run_formula_model(
     model_name: str = "PP-FormulaNet_plus-S",
     fallback_model_name: str | None = "PP-FormulaNet_plus-M",
     batch_size: int = 4,
+    device: str = "auto",
 ) -> tuple[float, float]:
     pending = sorted(
         [atom for atom in atoms if atom.route == "vision" and atom.crop_path],
@@ -346,7 +310,7 @@ def run_formula_model(
     )
     if not pending:
         return 0.0, 0.0
-    runtime = PaddleFormulaRuntime(model_name=model_name, device="cpu")
+    runtime = PaddleFormulaRuntime(model_name=model_name, device=device)
     predictions, inference_seconds = runtime.predict(
         [atom.crop_path for atom in pending if atom.crop_path],
         batch_size=batch_size,
@@ -354,12 +318,12 @@ def run_formula_model(
     for atom, prediction in zip(pending, predictions, strict=False):
         atom.latex = normalize_recognized_latex(prediction.latex)
         atom.model_score = prediction.score
-        atom.model_source = f"{model_name}:cpu"
+        atom.model_source = f"{model_name}:{runtime.device}"
 
     init_seconds = runtime.init_seconds
     retry = [atom for atom in pending if latex_validation_flags(atom.native_text, atom.latex, atom.model_score)]
     if retry and fallback_model_name and fallback_model_name != model_name:
-        fallback = PaddleFormulaRuntime(model_name=fallback_model_name, device="cpu")
+        fallback = PaddleFormulaRuntime(model_name=fallback_model_name, device=device)
         fallback_predictions, fallback_seconds = fallback.predict(
             [atom.crop_path for atom in retry if atom.crop_path],
             batch_size=max(1, min(batch_size, 2)),
@@ -377,7 +341,7 @@ def run_formula_model(
             ):
                 atom.latex = candidate
                 atom.model_score = prediction.score
-                atom.model_source = f"{fallback_model_name}:cpu-fallback"
+                atom.model_source = f"{fallback_model_name}:{fallback.device}-fallback"
     return init_seconds, inference_seconds
 
 
@@ -403,7 +367,10 @@ def run_formula_model_http(
         atom.latex = normalize_recognized_latex(str(item.get("latex", "")))
         score = item.get("score")
         atom.model_score = float(score) if score is not None else None
-        atom.model_source = f"{response.get('model', 'formula-service')}:http"
+        atom.model_source = (
+            f"{response.get('model', 'formula-service')}:"
+            f"{response.get('device', 'remote')}-http"
+        )
         seen.add(atom.id)
     missing = sorted(set(by_id) - seen)
     if missing:
@@ -411,91 +378,6 @@ def run_formula_model_http(
     # A persistent service paid model startup before this document request.
     # Keep per-document timings honest; /health exposes the service cold start.
     return 0.0, float(response.get("inference_seconds", 0.0))
-
-
-def run_formula_model_dgx(
-    atoms: list[FormulaAtom],
-    host: str = "dgx-aliyun",
-    batch_size: int = 8,
-    uvx_path: str = "~/.local/bin/uvx",
-) -> tuple[float, float]:
-    """Run MinerU's UniMERNet directly on formula crops through SSH."""
-    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
-        raise RuntimeError(f"DGX SSH host 不安全：{host!r}")
-    pending = [atom for atom in atoms if atom.route == "vision" and atom.crop_path]
-    if not pending:
-        return 0.0, 0.0
-
-    config = RemoteMineruConfig(host=host, uvx_path=uvx_path)
-    home = _run(
-        ssh_command(config, 'printf "%s" "$HOME"'),
-        capture_output=True,
-        attempts=config.transport_attempts,
-        retry_delay=config.retry_delay,
-    ).stdout.strip()
-    if not home.startswith("/"):
-        raise RuntimeError("无法解析 DGX HOME")
-    resolved_uvx = f"{home}/{uvx_path[2:]}" if uvx_path.startswith("~/") else uvx_path
-    remote_dir = _run(
-        ssh_command(
-            config,
-            "mkdir -p ~/.cache/research-pdf-parser/formula-runs && "
-            "mktemp -d ~/.cache/research-pdf-parser/formula-runs/run.XXXXXX",
-        ),
-        capture_output=True,
-        attempts=config.transport_attempts,
-        retry_delay=config.retry_delay,
-    ).stdout.strip()
-    expected_prefix = f"{home}/.cache/research-pdf-parser/formula-runs/run."
-    if not remote_dir.startswith(expected_prefix):
-        raise RuntimeError(f"DGX 临时目录异常：{remote_dir!r}")
-
-    try:
-        _run(
-            scp_command(config, *[str(atom.crop_path) for atom in pending], f"{host}:{remote_dir}/"),
-            attempts=config.transport_attempts,
-            retry_delay=config.retry_delay,
-        )
-        command = (
-            f"MINERU_MODEL_SOURCE=modelscope {shlex.quote(resolved_uvx)} "
-            "--managed-python --python 3.12 --from 'mineru[all]' "
-            f"python - {shlex.quote(remote_dir)} {int(batch_size)}"
-        )
-        completed = _run(
-            ssh_command(config, command),
-            input=DGX_FORMULA_RUNNER,
-            capture_output=True,
-        )
-    finally:
-        _run(
-            ssh_command(config, f"rm -rf -- {shlex.quote(remote_dir)}"),
-            capture_output=True,
-            attempts=config.transport_attempts,
-            retry_delay=config.retry_delay,
-        )
-
-    by_id = {atom.id: atom for atom in pending}
-    init_seconds = inference_seconds = 0.0
-    seen: set[str] = set()
-    for line in completed.stdout.splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if "_meta" in payload:
-            init_seconds = float(payload["_meta"].get("init_seconds", 0.0))
-            inference_seconds = float(payload["_meta"].get("inference_seconds", 0.0))
-            continue
-        atom = by_id.get(str(payload.get("id", "")))
-        if atom is None:
-            continue
-        atom.latex = normalize_recognized_latex(str(payload.get("latex", "")))
-        atom.model_source = "mineru-unimernet-small:dgx-cuda"
-        seen.add(atom.id)
-    missing = sorted(set(by_id) - seen)
-    if missing:
-        raise RuntimeError(f"DGX 未返回 {len(missing)} 个公式结果：{missing[:5]}")
-    return init_seconds, inference_seconds
 
 
 def latex_validation_flags(native_text: str, latex: str, score: float | None = None) -> list[str]:
@@ -1070,8 +952,7 @@ def parse_cpu_hybrid(
     batch_size: int = 4,
     render_scale: float = 4.0,
     run_model: bool = True,
-    formula_device: str = "cpu",
-    dgx_host: str = "dgx-aliyun",
+    formula_device: str = "auto",
     formula_server_url: str | None = None,
 ) -> CPUHybridResult:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1121,18 +1002,13 @@ def parse_cpu_hybrid(
                 formula_server_url,
                 batch_size=batch_size,
             )
-        elif formula_device == "dgx":
-            model_init_seconds, model_inference_seconds = run_formula_model_dgx(
-                atoms,
-                host=dgx_host,
-                batch_size=batch_size,
-            )
-        elif formula_device == "cpu":
+        elif formula_device in {"auto", "cpu", "gpu"}:
             model_init_seconds, model_inference_seconds = run_formula_model(
                 atoms,
                 model_name=model_name,
                 fallback_model_name=fallback_model_name,
                 batch_size=batch_size,
+                device=formula_device,
             )
         else:
             raise ValueError(f"未知公式推理设备：{formula_device}")

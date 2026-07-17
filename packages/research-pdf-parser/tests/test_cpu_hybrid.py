@@ -27,9 +27,9 @@ from research_pdf_parser.formula_runtime import FormulaPrediction
 class CPUHybridTests(unittest.TestCase):
     @mock.patch("research_pdf_parser.cpu_hybrid.PaddleFormulaRuntime")
     def test_small_model_reject_uses_medium_model_fallback(self, runtime: mock.Mock) -> None:
-        primary = mock.Mock(init_seconds=1.0)
+        primary = mock.Mock(init_seconds=1.0, device="cpu")
         primary.predict.return_value = ([FormulaPrediction("x_{", 0.95)], 2.0)
-        fallback = mock.Mock(init_seconds=3.0)
+        fallback = mock.Mock(init_seconds=3.0, device="cpu")
         fallback.predict.return_value = ([FormulaPrediction(r"DASTD=\sqrt{x}", 0.8)], 4.0)
         runtime.side_effect = [primary, fallback]
         atom = FormulaAtom(
@@ -71,7 +71,7 @@ class CPUHybridTests(unittest.TestCase):
         latex = "STOQ=" + "_{x}" * 20
         self.assertIn("excessive_scripts", latex_validation_flags("S T O Q", latex))
 
-    def test_rejects_balanced_dgx_layout_artifacts(self) -> None:
+    def test_rejects_balanced_model_layout_artifacts(self) -> None:
         self.assertIn(
             "formula_command_noise",
             latex_validation_flags("objective", r"\stackrel{\longrightarrow}{x}"),

@@ -12,7 +12,7 @@ from liteparse import LiteParse
 
 from .assets import markdown_assets_dir, rebundle_markdown_images
 from .markdown_cleanup import normalize_markdown, prefer_table_of_contents
-from .mineru_remote import RemoteMineruConfig, convert_pdf_on_dgx
+from .mineru_remote import RemoteMineruConfig, convert_pdf_on_remote_gpu
 
 
 @dataclass(frozen=True)
@@ -46,13 +46,12 @@ def parse_best_pdf(
     pdf_path: Path,
     output_path: Path,
     *,
-    config: RemoteMineruConfig | None = None,
+    config: RemoteMineruConfig,
 ) -> HighAccuracyResult:
     """Run MinerU remotely and apply deterministic local Markdown cleanup."""
-    config = config or RemoteMineruConfig()
     started = time.perf_counter()
     with TemporaryDirectory(prefix="research-pdf-parser-mineru-") as directory:
-        raw_markdown_path = convert_pdf_on_dgx(pdf_path, Path(directory), config)
+        raw_markdown_path = convert_pdf_on_remote_gpu(pdf_path, Path(directory), config)
         markdown = raw_markdown_path.read_text(encoding="utf-8")
         try:
             reference_toc = _vector_toc(pdf_path)

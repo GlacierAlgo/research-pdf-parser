@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .accelerator import resolve_formula_device
+
 
 @dataclass(frozen=True)
 class FormulaPrediction:
@@ -36,21 +38,27 @@ def paddle_result(result: Any) -> dict[str, Any]:
 class PaddleFormulaRuntime:
     """Load one PP-FormulaNet model once and reuse it across batches."""
 
-    def __init__(self, model_name: str = "PP-FormulaNet_plus-S", device: str = "cpu") -> None:
+    def __init__(self, model_name: str = "PP-FormulaNet_plus-S", device: str = "auto") -> None:
         os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         try:
             from paddleocr import FormulaRecognition
         except ImportError as exc:
             raise RuntimeError(
-                "CPU formula runtime is unavailable; install with `uv sync --extra formula-cpu`."
+                "Local formula runtime is unavailable; install with `uv sync --extra formula-cpu` "
+                "or provide --formula-server-url http://HOST/formula_ocr."
             ) from exc
 
         started = time.perf_counter()
-        self._model = FormulaRecognition(model_name=model_name, device=device, engine="paddle_static")
+        resolved_device = resolve_formula_device(device)
+        self._model = FormulaRecognition(
+            model_name=model_name,
+            device=resolved_device,
+            engine="paddle_static",
+        )
         self.init_seconds = time.perf_counter() - started
         self.model_name = model_name
-        self.device = device
+        self.device = resolved_device
 
     def predict(self, paths: list[Path], batch_size: int = 4) -> tuple[list[FormulaPrediction], float]:
         started = time.perf_counter()
