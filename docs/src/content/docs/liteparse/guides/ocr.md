@@ -7,7 +7,14 @@ sidebar:
 
 LiteParse uses OCR selectively — only on embedded images or pages where native text extraction didn't find text. This keeps parsing fast while still capturing text from scanned pages and embedded images.
 
-## Built-in Tesseract (default)
+> **Research fork note:** `GlacierAlgo/research-pdf-parser` builds its Python
+> extension without Tesseract. Its high-level parser explicitly disables OCR
+> and reports scanned pages as `scanned-deferred`. The Tesseract instructions
+> below apply only to upstream/feature-enabled LiteParse builds; an explicit
+> HTTP OCR server still works at the low-level LiteParse API but is not part of
+> the high-level native-vector product profiles.
+
+## Built-in Tesseract (feature-enabled upstream builds)
 
 Tesseract is bundled with LiteParse and works out of the box. Just run:
 

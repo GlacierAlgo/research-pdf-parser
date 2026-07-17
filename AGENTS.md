@@ -10,7 +10,8 @@ Language bindings are provided for **Node.js/TypeScript** (via napi-rs), **Pytho
 
 ### Key Capabilities
 - **Spatial text extraction** with precise bounding boxes
-- **Flexible OCR** (built-in Tesseract or pluggable HTTP servers)
+- **Flexible upstream OCR** (feature-gated Tesseract or pluggable HTTP servers);
+  this research fork's Python/high-level path disables Tesseract and defers scans
 - **Multi-format support** (PDFs, DOCX, XLSX, PPTX, images via conversion)
 - **Multi-language bindings**: Rust, Node.js/TypeScript, Python, Browser (WASM)
 - **CLI** available from all installation methods (`cargo`, `npm`, `pip`)
@@ -87,7 +88,8 @@ Each binding crate is thin — it wraps the core `liteparse` crate's types and a
 
 ### 2. OCR Engine Trait
 OCR functionality uses a trait-based abstraction (`OcrEngine`). This allows:
-- Built-in Tesseract (default, compiled in via `tesseract-rs`)
+- Built-in Tesseract when compiled with the `tesseract` feature; it is not in
+  the research fork's default Python build
 - HTTP OCR server client for remote engines
 - Custom JS-side OCR in the WASM build via a callback interface
 

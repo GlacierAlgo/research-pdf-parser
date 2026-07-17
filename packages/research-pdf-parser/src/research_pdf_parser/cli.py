@@ -8,9 +8,44 @@ from pathlib import Path
 import click
 
 from . import __version__, legacy_pipeline
+from .contracts import ParseResult
 from .doctor import capability_dicts, inspect_capabilities
-from .native import parse_native_pdf
+from .facade import parse_pdf
+from .formula_service import serve_formula_runtime
+from .mineru_remote import RemoteMineruConfig
+from .probe import probe_pdf
 from .recursive_help import RecursiveHelpGroup
+
+
+def _write_optional_result(result: ParseResult, result_json: Path | None) -> None:
+    if result_json:
+        result.write_json(result_json)
+        click.echo(f"result: {result_json}")
+
+
+def _echo_result(result: ParseResult) -> None:
+    click.echo(f"markdown: {result.markdown_path}")
+    click.echo(f"route: {result.requested_profile} -> {result.actual_profile}")
+    click.echo(f"reason: {', '.join(result.route_reasons)}")
+    click.echo(
+        "quality: {} · blocks={} · formulas={} · latex={} · image-fallbacks={}".format(
+            result.quality.status,
+            result.quality.block_count,
+            result.quality.formula_candidates,
+            result.quality.accepted_latex,
+            result.quality.image_fallbacks,
+        )
+    )
+    click.echo("timings: " + ", ".join(f"{name}={seconds:.3f}s" for name, seconds in result.timings.items()))
+    for warning in result.warnings:
+        click.echo(f"warning: {warning}", err=True)
+
+
+def _parse_with_errors(**kwargs: object) -> ParseResult:
+    try:
+        return parse_pdf(**kwargs)  # type: ignore[arg-type]
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @click.group(cls=RecursiveHelpGroup)
@@ -21,7 +56,51 @@ def cli() -> None:
 
 @cli.group("parse", cls=RecursiveHelpGroup)
 def parse_group() -> None:
-    """Choose a parsing profile by document complexity and compute budget."""
+    """Use one explicit profile or let the content probe choose locally."""
+
+
+@parse_group.command("auto")
+@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "output", required=True, type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--pages", help="1-indexed selection such as '1,4-5'.")
+@click.option("--images", type=click.Choice(["off", "embed"]), default="off", show_default=True)
+@click.option(
+    "--formula-model/--no-formula-model",
+    default=None,
+    help="Auto-detect the local model by default; disabling keeps vector-image fallbacks.",
+)
+@click.option("--model", default="PP-FormulaNet_plus-S", show_default=True)
+@click.option("--fallback-model", default="PP-FormulaNet_plus-M", show_default=True)
+@click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
+@click.option("--batch-size", type=click.IntRange(min=1), default=4, show_default=True)
+@click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
+def parse_auto(
+    pdf: Path,
+    output: Path,
+    pages: str | None,
+    images: str,
+    formula_model: bool | None,
+    model: str,
+    fallback_model: str,
+    formula_server_url: str | None,
+    batch_size: int,
+    result_json: Path | None,
+) -> None:
+    """Probe once; choose native-fast or formula-cpu, never DGX."""
+    result = _parse_with_errors(
+        pdf_path=pdf,
+        output_path=output,
+        profile="auto",
+        pages=pages,
+        image_mode=images,
+        run_formula_model=formula_model,
+        formula_model=model,
+        fallback_formula_model=fallback_model or None,
+        formula_server_url=formula_server_url,
+        batch_size=batch_size,
+    )
+    _echo_result(result)
+    _write_optional_result(result, result_json)
 
 
 @parse_group.command("native-fast")
@@ -33,33 +112,160 @@ def parse_group() -> None:
     type=click.Choice(["off", "embed"]),
     default="off",
     show_default=True,
-    help="Keep one Markdown file by default; embed writes referenced images to _assets.",
+    help="The default writes exactly one Markdown file.",
 )
-def native_fast(pdf: Path, output: Path, pages: str | None, images: str) -> None:
-    """Single-pass LiteParse for announcements and formula-light PDFs."""
+@click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
+def native_fast(pdf: Path, output: Path, pages: str | None, images: str, result_json: Path | None) -> None:
+    """One OCR-free LiteParse pass for announcements and simple reports."""
+    result = _parse_with_errors(
+        pdf_path=pdf,
+        output_path=output,
+        profile="native-fast",
+        pages=pages,
+        image_mode=images,
+    )
+    _echo_result(result)
+    _write_optional_result(result, result_json)
+
+
+@parse_group.command("formula-cpu")
+@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "output", required=True, type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--pages", help="1-indexed selection such as '1,4-5'.")
+@click.option("--model", default="PP-FormulaNet_plus-S", show_default=True)
+@click.option("--fallback-model", default="PP-FormulaNet_plus-M", show_default=True)
+@click.option("--batch-size", type=click.IntRange(min=1), default=4, show_default=True)
+@click.option("--render-scale", type=click.FloatRange(min=1.0), default=4.0, show_default=True)
+@click.option(
+    "--formula-device",
+    type=click.Choice(["cpu", "dgx"]),
+    default="cpu",
+    show_default=True,
+    help="DGX changes only the formula candidate source; validation and final Grid stay local.",
+)
+@click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
+@click.option("--dgx-host", default="dgx-aliyun", show_default=True)
+@click.option("--no-formula-model", is_flag=True, help="Use crisp vector crops for every visual formula.")
+@click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
+def formula_cpu(
+    pdf: Path,
+    output: Path,
+    pages: str | None,
+    model: str,
+    fallback_model: str,
+    batch_size: int,
+    render_scale: float,
+    formula_device: str,
+    formula_server_url: str | None,
+    dgx_host: str,
+    no_formula_model: bool,
+    result_json: Path | None,
+) -> None:
+    """Validate formula candidates, inject FormulaAtoms, then rebuild Grid."""
+    result = _parse_with_errors(
+        pdf_path=pdf,
+        output_path=output,
+        profile="formula-cpu",
+        pages=pages,
+        run_formula_model=not no_formula_model,
+        formula_model=model,
+        fallback_formula_model=fallback_model or None,
+        formula_server_url=formula_server_url,
+        formula_device=formula_device,
+        batch_size=batch_size,
+        render_scale=render_scale,
+        dgx_config=RemoteMineruConfig(host=dgx_host),
+    )
+    _echo_result(result)
+    _write_optional_result(result, result_json)
+
+
+@parse_group.command("formula-best")
+@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "output", required=True, type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--dgx-host", default="dgx-aliyun", envvar="RESEARCH_PDF_PARSER_DGX_HOST", show_default=True)
+@click.option("--remote-uvx", default="~/.local/bin/uvx", envvar="RESEARCH_PDF_PARSER_DGX_UVX", show_default=True)
+@click.option("--backend", type=click.Choice(["hybrid-engine", "pipeline"]), default="hybrid-engine")
+@click.option("--effort", type=click.Choice(["low", "medium", "high"]), default="high")
+@click.option("--keep-remote", is_flag=True)
+@click.option("--result-json", type=click.Path(dir_okay=False, path_type=Path))
+def formula_best(
+    pdf: Path,
+    output: Path,
+    dgx_host: str,
+    remote_uvx: str,
+    backend: str,
+    effort: str,
+    keep_remote: bool,
+    result_json: Path | None,
+) -> None:
+    """Explicit MinerU high-accuracy path on DGX; auto never selects it."""
+    result = _parse_with_errors(
+        pdf_path=pdf,
+        output_path=output,
+        profile="formula-best",
+        dgx_config=RemoteMineruConfig(
+            host=dgx_host,
+            uvx_path=remote_uvx,
+            backend=backend,
+            effort=effort,
+            keep_remote=keep_remote,
+        ),
+    )
+    _echo_result(result)
+    _write_optional_result(result, result_json)
+
+
+@cli.command("probe")
+@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--pages", help="1-indexed selection such as '1,4-5'.")
+@click.option("--json-output", is_flag=True)
+def probe_command(pdf: Path, pages: str | None, json_output: bool) -> None:
+    """Explain the cheap content-derived route before expensive inference."""
     try:
-        result = parse_native_pdf(pdf, output, pages=pages, image_mode=images)
+        probe = probe_pdf(pdf, pages=pages).probe
     except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"markdown: {result.markdown_path}")
-    click.echo(f"LiteParse: {result.parse_seconds:.3f}s; pages={result.page_count}")
-    if result.skipped_pages:
-        click.echo(f"skipped scanned pages: {result.skipped_pages}", err=True)
-
-
-@cli.group("formula", cls=RecursiveHelpGroup)
-def formula_group() -> None:
-    """Legacy formula experiments retained for comparison and migration."""
+    if json_output:
+        click.echo(json.dumps(probe.to_dict(), ensure_ascii=False, indent=2))
+        return
+    click.echo(f"recommended: {probe.recommended_profile}")
+    click.echo(f"reason: {', '.join(probe.route_reasons)}")
+    click.echo(
+        "page  chars  formula  vision  table  scanned  score  reasons\n"
+        "----  -----  -------  ------  -----  -------  -----  -------"
+    )
+    for page in probe.pages:
+        click.echo(
+            f"{page.page:>4}  {page.native_chars:>5}  {page.formula_candidates:>7}  "
+            f"{page.vision_formula_candidates:>6}  {page.table_formula_candidates:>5}  "
+            f"{str(page.scanned):>7}  {page.complexity_score:>5}  {', '.join(page.reasons)}"
+        )
+    click.echo(f"probe: {probe.probe_seconds:.3f}s")
 
 
 @cli.command("doctor")
-@click.option("--check-dgx", is_flag=True, help="Also verify SSH connectivity to the DGX worker.")
+@click.option("--check-dgx", is_flag=True, help="Verify SSH and the configured remote uvx.")
 @click.option("--dgx-host", default="dgx-aliyun", show_default=True)
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON.")
-@click.option("--strict", is_flag=True, help="Exit non-zero when a required capability is missing.")
-def doctor(check_dgx: bool, dgx_host: str, json_output: bool, strict: bool) -> None:
-    """Show installed parser, model, and optional DGX capabilities."""
-    capabilities = inspect_capabilities(check_dgx=check_dgx, dgx_host=dgx_host)
+@click.option("--remote-uvx", default="~/.local/bin/uvx", show_default=True)
+@click.option("--formula-server-url", envvar="RESEARCH_PDF_PARSER_FORMULA_URL")
+@click.option("--json-output", is_flag=True)
+@click.option("--strict", is_flag=True)
+def doctor(
+    check_dgx: bool,
+    dgx_host: str,
+    remote_uvx: str,
+    formula_server_url: str | None,
+    json_output: bool,
+    strict: bool,
+) -> None:
+    """Show required local and optional model/DGX capabilities."""
+    capabilities = inspect_capabilities(
+        check_dgx=check_dgx,
+        dgx_host=dgx_host,
+        remote_uvx=remote_uvx,
+        formula_server_url=formula_server_url,
+    )
     if json_output:
         click.echo(json.dumps(capability_dicts(capabilities), ensure_ascii=False, indent=2))
     else:
@@ -71,11 +277,32 @@ def doctor(check_dgx: bool, dgx_host: str, json_output: bool, strict: bool) -> N
         raise click.ClickException("one or more required capabilities are missing")
 
 
-parse_group.add_command(legacy_pipeline.parse_cpu, name="formula-cpu")
-parse_group.add_command(legacy_pipeline.parse_best, name="formula-best")
-parse_group.add_command(legacy_pipeline.parse, name="legacy-placeholders")
-formula_group.add_command(legacy_pipeline.fill_formulas, name="fill")
-formula_group.add_command(legacy_pipeline.benchmark_formulas, name="benchmark")
+@cli.group("serve", cls=RecursiveHelpGroup)
+def serve_group() -> None:
+    """Run optional persistent inference services."""
+
+
+@serve_group.command("formula-cpu")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", type=click.IntRange(min=1, max=65535), default=8765, show_default=True)
+@click.option("--model", default="PP-FormulaNet_plus-S", show_default=True)
+def serve_formula_cpu(host: str, port: int, model: str) -> None:
+    """Load PP-FormulaNet once and serve trusted-network batch requests."""
+    click.echo(f"loading {model} on cpu; listening at http://{host}:{port}")
+    try:
+        serve_formula_runtime(host=host, port=port, model_name=model)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.group("experiment", cls=RecursiveHelpGroup)
+def experiment_group() -> None:
+    """Legacy placeholder and OCR-comparison surfaces, not product profiles."""
+
+
+experiment_group.add_command(legacy_pipeline.parse, name="legacy-placeholders")
+experiment_group.add_command(legacy_pipeline.fill_formulas, name="fill")
+experiment_group.add_command(legacy_pipeline.benchmark_formulas, name="benchmark")
 
 
 def main() -> None:

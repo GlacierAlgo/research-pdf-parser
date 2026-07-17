@@ -18,6 +18,23 @@ The supported path is intentionally narrow: native-vector PDFs only. Scanned
 pages are detected, logged, and skipped by the outer parser. OCR model choice,
 formula validation, storage, and DGX dispatch remain outside LiteParse.
 
+## High-level product surface
+
+`packages/research-pdf-parser` exposes one `parse_pdf(..., profile="auto")`
+facade and the matching Click command tree. An OCR-free content probe selects
+`native-fast`, `formula-cpu`, or `scanned-deferred`; `auto` never selects DGX.
+`formula-best` is an explicit remote high-accuracy request.
+
+The CPU formula layer can run PP-FormulaNet in process or through the included
+persistent batch service. It tries the small model first, sends structurally
+suspect candidates to the medium fallback, validates the result, and only then
+creates caller-trusted `FormulaAtom` values. Failed validation uses the vector
+crop instead of inserting speculative LaTeX.
+
+Canonical Markdown remains the default artifact. The optional
+`research-pdf-parser.result.v1` envelope adds route reasons, warnings, timings,
+quality, provenance, and sparse typed Markdown spans for downstream adapters.
+
 ## Repository layout
 
 - `crates/liteparse`: Rust/PDFium extraction, formula probing, table recovery,

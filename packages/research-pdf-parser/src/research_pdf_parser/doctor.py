@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
-import subprocess
 from dataclasses import asdict, dataclass
 
 import pymupdf
 from liteparse import FormulaAtom, LiteParse
 from liteparse import __version__ as liteparse_version
+
+from .formula_service import formula_service_health
+from .mineru_remote import RemoteMineruConfig, check_dgx_connection
 
 
 @dataclass(frozen=True)
@@ -20,7 +22,13 @@ class Capability:
     required: bool = False
 
 
-def inspect_capabilities(*, check_dgx: bool = False, dgx_host: str = "dgx-aliyun") -> list[Capability]:
+def inspect_capabilities(
+    *,
+    check_dgx: bool = False,
+    dgx_host: str = "dgx-aliyun",
+    remote_uvx: str = "~/.local/bin/uvx",
+    formula_server_url: str | None = None,
+) -> list[Capability]:
     capabilities = [
         Capability(
             "liteparse-formula-atom",
@@ -29,6 +37,12 @@ def inspect_capabilities(*, check_dgx: bool = False, dgx_host: str = "dgx-aliyun
             required=True,
         ),
         Capability("pymupdf", True, f"PyMuPDF {pymupdf.VersionBind}", required=True),
+        Capability(
+            "native-vector-policy",
+            True,
+            "OCR disabled; scanned pages are logged and deferred",
+            required=True,
+        ),
         Capability(
             "formula-cpu",
             importlib.util.find_spec("paddleocr") is not None,
@@ -41,15 +55,21 @@ def inspect_capabilities(*, check_dgx: bool = False, dgx_host: str = "dgx-aliyun
             required=check_dgx,
         ),
     ]
+    if formula_server_url:
+        try:
+            health = formula_service_health(formula_server_url)
+            detail = f"{health.get('model', 'unknown')} on {health.get('device', 'unknown')}"
+            capabilities.append(Capability("formula-service", True, detail))
+        except RuntimeError as exc:
+            capabilities.append(Capability("formula-service", False, str(exc)))
     if check_dgx:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", dgx_host, "true"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        detail = "reachable" if result.returncode == 0 else (result.stderr.strip() or "unreachable")
-        capabilities.append(Capability("dgx", result.returncode == 0, detail, required=True))
+        try:
+            detail = check_dgx_connection(RemoteMineruConfig(host=dgx_host, uvx_path=remote_uvx))
+            available = "uvx=ok" in detail
+        except RuntimeError as exc:
+            available = False
+            detail = str(exc)
+        capabilities.append(Capability("dgx", available, detail, required=True))
     return capabilities
 
 

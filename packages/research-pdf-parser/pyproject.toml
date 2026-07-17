@@ -4,16 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "research-pdf-parser"
-version = "0.2.0"
-description = "CPU-first PDF-to-Markdown parsing with validated formula reconstruction"
+version = "0.3.0"
+description = "Tiered native-vector PDF-to-Markdown parsing with validated formula reconstruction"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 authors = [{ name = "GlacierAlgo" }]
 keywords = ["pdf", "markdown", "formula", "ocr", "liteparse"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Text Processing :: Markup",
 ]
@@ -56,7 +57,7 @@ packages = ["src/research_pdf_parser"]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
