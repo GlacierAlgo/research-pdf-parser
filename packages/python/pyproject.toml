@@ -31,7 +31,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/GlacierAlgo/research-pdf-parser"
-Documentation = "https://github.com/GlacierAlgo/research-pdf-parser/blob/feat/unified-research-parser/RESEARCH_FORK.md"
+Documentation = "https://github.com/GlacierAlgo/research-pdf-parser/blob/main/RESEARCH_FORK.md"
 Repository = "https://github.com/GlacierAlgo/research-pdf-parser"
 
 [project.scripts]

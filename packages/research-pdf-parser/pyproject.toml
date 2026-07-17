@@ -38,7 +38,7 @@ rpdf = "research_pdf_parser.cli:main"
 [project.urls]
 Repository = "https://github.com/GlacierAlgo/research-pdf-parser"
 Issues = "https://github.com/GlacierAlgo/research-pdf-parser/issues"
-"LiteParse core" = "https://github.com/GlacierAlgo/research-pdf-parser/tree/feat/unified-research-parser/crates/liteparse"
+"LiteParse core" = "https://github.com/GlacierAlgo/research-pdf-parser/tree/main/crates/liteparse"
 
 [tool.uv.sources]
 liteparse = { path = "../python", editable = true }
