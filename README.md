@@ -1,4 +1,12 @@
-# LiteParse
+# research-pdf-parser
+
+> This fork combines the patched LiteParse core and the high-level
+> [`research-pdf-parser`](packages/research-pdf-parser) package in one versioned
+> repository. It targets native-vector announcements and formula-heavy research
+> reports; scanned PDFs are logged and skipped. See
+> [RESEARCH_FORK.md](RESEARCH_FORK.md) for the maintained fork boundary.
+
+# LiteParse upstream documentation
 
 [![CI](https://github.com/run-llama/liteparse/actions/workflows/ci.yml/badge.svg)](https://github.com/run-llama/liteparse/actions/workflows/ci.yml)
 |

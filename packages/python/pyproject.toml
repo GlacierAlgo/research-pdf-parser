@@ -30,9 +30,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/GlacierAlgo/liteparse"
-Documentation = "https://github.com/GlacierAlgo/liteparse/blob/research-formula-v0.1.0/RESEARCH_FORK.md"
-Repository = "https://github.com/GlacierAlgo/liteparse"
+Homepage = "https://github.com/GlacierAlgo/research-pdf-parser"
+Documentation = "https://github.com/GlacierAlgo/research-pdf-parser/blob/feat/unified-research-parser/RESEARCH_FORK.md"
+Repository = "https://github.com/GlacierAlgo/research-pdf-parser"
 
 [project.scripts]
 lit = "liteparse.cli:main"

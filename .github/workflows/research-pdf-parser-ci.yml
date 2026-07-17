@@ -1,0 +1,45 @@
+name: Research PDF Parser CI
+
+on:
+  push:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/liteparse/**"
+      - "crates/liteparse-python/**"
+      - "packages/python/**"
+      - "packages/research-pdf-parser/**"
+      - ".github/workflows/research-pdf-parser-ci.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/liteparse/**"
+      - "crates/liteparse-python/**"
+      - "packages/python/**"
+      - "packages/research-pdf-parser/**"
+      - ".github/workflows/research-pdf-parser-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Rust core tests
+        run: cargo test -p liteparse --lib --no-default-features
+      - name: Install unified Python packages
+        working-directory: packages/research-pdf-parser
+        run: uv sync --group dev
+      - name: Python tests
+        working-directory: packages/research-pdf-parser
+        run: uv run pytest
+      - name: Python lint
+        working-directory: packages/research-pdf-parser
+        run: uv run ruff check src tests
+      - name: Build high-level package
+        working-directory: packages/research-pdf-parser
+        run: uv build
