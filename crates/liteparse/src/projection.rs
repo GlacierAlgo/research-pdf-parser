@@ -2833,9 +2833,46 @@ fn clean_rendered_text(text: &str) -> String {
 }
 
 pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
+    project_pages_to_grid_with_formula_atoms(pages, Vec::new())
+        .expect("projecting without formula atoms cannot fail")
+}
+
+/// Project pages after replacing caller-validated regions with indivisible
+/// formula atoms. Candidate probing always observes the original native page;
+/// replacement happens immediately afterward and before the final grid.
+pub fn project_pages_to_grid_with_formula_atoms(
+    pages: Vec<Page>,
+    formula_atoms: Vec<crate::types::FormulaAtom>,
+) -> Result<Vec<ParsedPage>, crate::error::LiteParseError> {
+    let page_numbers: std::collections::HashSet<usize> =
+        pages.iter().map(|page| page.page_number).collect();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut atoms_by_page: HashMap<usize, Vec<crate::types::FormulaAtom>> = HashMap::new();
+    for atom in formula_atoms {
+        if !page_numbers.contains(&atom.page_number) {
+            return Err(format!("formula atom {} targets an unparsed page", atom.id).into());
+        }
+        if !seen_ids.insert(atom.id.clone()) {
+            return Err(format!("duplicate formula atom id: {}", atom.id).into());
+        }
+        atoms_by_page
+            .entry(atom.page_number)
+            .or_default()
+            .push(atom);
+    }
+
     pages
         .into_iter()
-        .map(|page| {
+        .map(|mut page| {
+            let formula_candidates = crate::formula_probe::probe_formula_candidates(&page);
+            let mut formula_atoms = atoms_by_page.remove(&page.page_number).unwrap_or_default();
+            formula_atoms.sort_by(|a, b| {
+                a.bbox
+                    .y
+                    .total_cmp(&b.bbox.y)
+                    .then(a.bbox.x.total_cmp(&b.bbox.x))
+            });
+            crate::formula_atom::apply_formula_atoms(&mut page, &formula_atoms)?;
             let projection_boxes = page
                 .text_items
                 .iter()
@@ -2886,7 +2923,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 page.page_height,
                 &obstacles,
             );
-            ParsedPage {
+            Ok(ParsedPage {
                 page_number: page.page_number,
                 page_width: page.page_width,
                 page_height: page.page_height,
@@ -2903,13 +2940,15 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                         ..proj.item
                     })
                     .collect(),
+                formula_candidates,
+                formula_atoms,
                 projected_lines,
                 regions,
                 graphics: page.graphics,
                 figures,
                 struct_nodes: page.struct_nodes,
                 image_refs: page.image_refs,
-            }
+            })
         })
         .collect()
 }

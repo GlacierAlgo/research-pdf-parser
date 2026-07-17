@@ -116,7 +116,9 @@ pub(super) fn render_line_inline(line: &ProjectedLine) -> String {
     // Per-line shortcut — only when the whole line shares one style AND carries
     // no hyperlinks (a link must wrap only the spans it covers, so link lines
     // always take the per-group path below).
-    let uniform = styles.iter().all(|s| *s == styles[0]) && links.iter().all(|l| l.is_none());
+    let uniform = styles.iter().all(|s| *s == styles[0])
+        && links.iter().all(|l| l.is_none())
+        && spans.iter().all(|span| !span.is_formula_atom());
     if uniform {
         let joined = collapse_whitespace(&line.text);
         if joined.is_empty() {
@@ -134,10 +136,22 @@ pub(super) fn render_line_inline(line: &ProjectedLine) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < spans.len() {
+        if spans[i].is_formula_atom() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            out.push_str(spans[i].text.trim());
+            i += 1;
+            continue;
+        }
         let style = styles[i];
         let link = links[i];
         let mut j = i + 1;
-        while j < spans.len() && styles[j] == style && links[j] == link {
+        while j < spans.len()
+            && !spans[j].is_formula_atom()
+            && styles[j] == style
+            && links[j] == link
+        {
             j += 1;
         }
         let mut group_text = String::new();
@@ -232,7 +246,7 @@ pub(super) fn line_uniform_style(line: &ProjectedLine) -> Option<SpanStyle> {
     if line
         .spans
         .iter()
-        .any(|s| !s.text.trim().is_empty() && s.link.is_some())
+        .any(|s| !s.text.trim().is_empty() && (s.link.is_some() || s.is_formula_atom()))
     {
         return None;
     }
@@ -261,7 +275,7 @@ pub(super) fn line_all_bold(line: &ProjectedLine) -> bool {
         if span.text.trim().is_empty() {
             continue;
         }
-        if is_mono_item(span) || !is_bold_item(span) {
+        if span.is_formula_atom() || is_mono_item(span) || !is_bold_item(span) {
             return false;
         }
         saw_span = true;

@@ -21,6 +21,8 @@ mod tests {
             text: text.into(),
             markdown: String::new(),
             text_items: vec![],
+            formula_candidates: vec![],
+            formula_atoms: vec![],
             projected_lines: vec![],
             regions: crate::types::Region::default(),
             graphics: vec![],

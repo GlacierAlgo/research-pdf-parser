@@ -1814,6 +1814,7 @@ impl SegmentBuilder {
                 link: None,
                 strike: false,
                 words: std::mem::take(&mut self.words),
+                kind: Default::default(),
             });
         }
 

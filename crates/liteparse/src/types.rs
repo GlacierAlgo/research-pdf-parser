@@ -76,6 +76,29 @@ pub struct TextItem {
     /// marshalled across the napi boundary.
     #[serde(skip)]
     pub words: Vec<WordBox>,
+    /// Semantic identity carried through grid projection. Formula atoms are
+    /// deliberately represented as one item so projection may move the atom
+    /// but can never split or re-escape its validated Markdown payload.
+    #[serde(skip)]
+    pub kind: TextItemKind,
+}
+
+impl TextItem {
+    pub fn is_formula_atom(&self) -> bool {
+        matches!(self.kind, TextItemKind::FormulaAtom { .. })
+    }
+}
+
+/// Internal semantic kind of a projected text item.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TextItemKind {
+    #[default]
+    Text,
+    FormulaAtom {
+        id: String,
+        source: String,
+    },
 }
 
 /// One word's bounding box within a `TextItem`, in the same viewport space
@@ -151,6 +174,18 @@ pub struct ParsedPage {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub markdown: String,
     pub text_items: Vec<TextItem>,
+    /// Read-only formula candidates detected from native vector text and page
+    /// graphics immediately before grid projection.  Recognition is kept out
+    /// of the Rust core: callers may preserve `native_text`, send `vision`
+    /// candidates to a local image-to-LaTeX service, or use `bbox` as a crisp
+    /// vector-crop fallback.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub formula_candidates: Vec<FormulaCandidate>,
+    /// Validated formula replacements applied before this page's final grid
+    /// projection. Each entry corresponds to exactly one indivisible formula
+    /// item in `text_items` / `projected_lines`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub formula_atoms: Vec<FormulaAtom>,
     /// Per-line structural metadata used by the markdown emitter. Not part of
     /// the JSON/text outputs (consumed internally) so it is `#[serde(skip)]`.
     #[serde(skip)]
@@ -180,6 +215,60 @@ pub struct ParsedPage {
     /// page has no embedded images. Not part of JSON/text output.
     #[serde(skip)]
     pub image_refs: Vec<ImageRef>,
+}
+
+/// Routing decision produced by the pre-grid formula probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormulaRoute {
+    /// Preserve and reorder the PDF's native vector text.  Used for code-like
+    /// expressions such as Alpha factor rows where OCR commonly damages names.
+    NativeText,
+    /// Render only this bbox and send it to a formula-recognition model.
+    Vision,
+}
+
+impl FormulaRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FormulaRoute::NativeText => "native_text",
+            FormulaRoute::Vision => "vision",
+        }
+    }
+}
+
+/// A formula-shaped native PDF region discovered before final grid projection.
+#[derive(Debug, Clone, Serialize)]
+pub struct FormulaCandidate {
+    /// Stable page-scoped identifier (`formula_p0005_001`).
+    pub id: String,
+    /// Viewport-space coordinates (top-left origin, 72 DPI).
+    pub bbox: Rect,
+    pub route: FormulaRoute,
+    /// Native token stream in reading order.  This is evidence and a possible
+    /// fast-path output, not guessed LaTeX.
+    pub text: String,
+    pub confidence: f32,
+    pub reasons: Vec<String>,
+}
+
+/// A caller-validated formula replacement injected before final grid
+/// projection. `markdown` is trusted, already-delimited Markdown such as
+/// `$x^2$`, `$$x^2$$`, or a local image reference used as a visual fallback.
+#[derive(Debug, Clone, Serialize)]
+pub struct FormulaAtom {
+    /// Stable document-scoped identifier.
+    pub id: String,
+    /// 1-indexed source page number.
+    pub page_number: usize,
+    /// Viewport-space coordinates (top-left origin, 72 DPI).
+    pub bbox: Rect,
+    /// Validated Markdown payload emitted without escaping.
+    pub markdown: String,
+    pub confidence: f32,
+    /// Recognizer/validator identity, e.g. `pp-formulanet-cpu` or
+    /// `vector-image-fallback`.
+    pub source: String,
 }
 
 /// One embedded raster image on a page. `id` is a stable, page-scoped slug

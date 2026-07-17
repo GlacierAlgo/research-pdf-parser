@@ -48,10 +48,13 @@ All options are passed to the constructor:
 
 ```python
 parser = LiteParse(
-    ocr_enabled=True,              # Enable OCR (default: True)
-    ocr_language="eng",            # Tesseract language code
-    ocr_server_url=None,           # HTTP OCR server URL (optional)
-    tessdata_path=None,            # Path to tessdata directory (optional)
+    # This fixed native-vector fork defaults to False because its Python
+    # extension is built without Tesseract. Set True together with an
+    # ocr_server_url to enable OCR.
+    ocr_enabled=False,
+    ocr_language="eng",            # OCR language code
+    ocr_server_url=None,           # Required when OCR is enabled in this fork
+    tessdata_path=None,            # Only used by Tesseract-enabled builds
     max_pages=1000,                # Max pages to parse
     target_pages="1-5,10",         # Specific pages (optional)
     dpi=150,                       # Rendering DPI

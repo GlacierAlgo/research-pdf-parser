@@ -12,11 +12,13 @@ pub use font_db_resolver::FontDbResolver;
 pub use glyph_resolver::{GLYPH_RESOLVER_FONT_SIZE, GlyphResolver};
 pub use parser::{LiteParse, ParseResult, ScreenshotResult};
 pub use search::{SearchOptions, search_items};
-pub use types::{ParsedPage, TextItem, WordBox};
+pub use types::{FormulaAtom, FormulaCandidate, FormulaRoute, ParsedPage, TextItem, WordBox};
 
 // ── Modules with user-facing types (visible in docs) ───────────────────
 pub mod config;
 pub mod error;
+mod formula_atom;
+pub mod formula_probe;
 pub mod glyph_resolver;
 pub mod parser;
 pub mod search;

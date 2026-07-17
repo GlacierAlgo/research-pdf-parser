@@ -13,7 +13,7 @@ use crate::output::markdown;
 use crate::projection;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::render;
-use crate::types::{ExtractedImage, OutlineTarget, Page, ParsedPage, PdfInput};
+use crate::types::{ExtractedImage, FormulaAtom, OutlineTarget, Page, ParsedPage, PdfInput};
 use pdfium::Library;
 
 /// Result of parsing a document.
@@ -213,6 +213,18 @@ impl LiteParse {
     /// Use `PdfInput::Path` for files on disk or `PdfInput::Bytes` for
     /// in-memory PDF data (e.g. from a network response or Node.js Buffer).
     pub async fn parse_input(&self, input: PdfInput) -> Result<ParseResult, LiteParseError> {
+        self.parse_input_with_formula_atoms(input, Vec::new()).await
+    }
+
+    /// Parse a document while replacing caller-validated formula regions
+    /// immediately before the final grid projection. This is intentionally a
+    /// second-pass API: callers first parse/probe, recognize and validate the
+    /// candidate crops, then call this method with the accepted atoms.
+    pub async fn parse_input_with_formula_atoms(
+        &self,
+        input: PdfInput,
+        formula_atoms: Vec<FormulaAtom>,
+    ) -> Result<ParseResult, LiteParseError> {
         let log = |msg: &str| {
             if !self.config.quiet {
                 eprintln!("{}", msg);
@@ -359,7 +371,8 @@ impl LiteParse {
         );
 
         // Grid projection
-        let mut parsed_pages = projection::project_pages_to_grid(pages);
+        let mut parsed_pages =
+            projection::project_pages_to_grid_with_formula_atoms(pages, formula_atoms)?;
         let t2 = web_time::Instant::now();
         log(&format!(
             "[liteparse] project: {:.1}ms",
@@ -407,7 +420,20 @@ impl LiteParse {
     /// is fully synchronous. Used when an external extractor (e.g. with its
     /// own font-recovery pipeline) owns text extraction.
     pub fn parse_from_pages(&self, pages: Vec<Page>, outline: Vec<OutlineTarget>) -> ParseResult {
-        let mut parsed_pages = projection::project_pages_to_grid(pages);
+        self.parse_from_pages_with_formula_atoms(pages, outline, Vec::new())
+            .expect("projecting pre-extracted pages without formula atoms cannot fail")
+    }
+
+    /// Synchronous counterpart of [`Self::parse_input_with_formula_atoms`] for
+    /// callers that already own the extracted page objects.
+    pub fn parse_from_pages_with_formula_atoms(
+        &self,
+        pages: Vec<Page>,
+        outline: Vec<OutlineTarget>,
+        formula_atoms: Vec<FormulaAtom>,
+    ) -> Result<ParseResult, LiteParseError> {
+        let mut parsed_pages =
+            projection::project_pages_to_grid_with_formula_atoms(pages, formula_atoms)?;
 
         let full_text = if self.config.output_format == crate::config::OutputFormat::Markdown {
             let page_md =
@@ -425,12 +451,12 @@ impl LiteParse {
                 .join("\n\n")
         };
 
-        ParseResult {
+        Ok(ParseResult {
             pages: parsed_pages,
             text: full_text,
             outline,
             images: Vec::new(),
-        }
+        })
     }
 
     /// Generate screenshots of document pages as PNG bytes.
@@ -496,6 +522,7 @@ impl LiteParse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{FormulaAtom, GraphicPrimitive, ImageRef, Rect, StructNode, TextItem};
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
@@ -506,5 +533,74 @@ mod tests {
         let lp = LiteParse::new(cfg);
         assert!(!lp.config().ocr_enabled);
         assert_eq!(lp.config().max_pages, 7);
+    }
+
+    #[test]
+    fn formula_atom_survives_final_grid_and_markdown_verbatim() {
+        let mut cfg = LiteParseConfig::default();
+        cfg.ocr_enabled = false;
+        cfg.output_format = crate::config::OutputFormat::Markdown;
+        let parser = LiteParse::new(cfg);
+        let item = |text: &str, x: f32, y: f32| TextItem {
+            text: text.into(),
+            x,
+            y,
+            width: 30.0,
+            height: 10.0,
+            font_size: Some(10.0),
+            ..Default::default()
+        };
+        let page = Page {
+            page_number: 1,
+            page_width: 300.0,
+            page_height: 300.0,
+            text_items: vec![
+                item("before", 40.0, 30.0),
+                item("a", 100.0, 60.0),
+                item("b", 100.0, 68.0),
+                item("after", 40.0, 110.0),
+            ],
+            graphics: Vec::<GraphicPrimitive>::new(),
+            struct_nodes: Vec::<StructNode>::new(),
+            image_refs: Vec::<ImageRef>::new(),
+        };
+        let atom = FormulaAtom {
+            id: "f1".into(),
+            page_number: 1,
+            bbox: Rect {
+                x: 90.0,
+                y: 50.0,
+                width: 60.0,
+                height: 35.0,
+            },
+            markdown: r"$$\frac{a}{b}$$".into(),
+            confidence: 0.98,
+            source: "unit-test".into(),
+        };
+
+        let result = parser
+            .parse_from_pages_with_formula_atoms(vec![page], vec![], vec![atom])
+            .unwrap();
+        assert!(result.text.contains(r"$$\frac{a}{b}$$"), "{}", result.text);
+        assert!(!result.text.contains(r"\\frac"), "{}", result.text);
+        assert_eq!(result.pages[0].formula_atoms.len(), 1);
+        let formula_items: Vec<_> = result.pages[0]
+            .text_items
+            .iter()
+            .filter(|item| item.is_formula_atom())
+            .collect();
+        assert_eq!(formula_items.len(), 1);
+        assert!(
+            !result.pages[0]
+                .text_items
+                .iter()
+                .any(|item| item.text == "a")
+        );
+        assert!(
+            !result.pages[0]
+                .text_items
+                .iter()
+                .any(|item| item.text == "b")
+        );
     }
 }

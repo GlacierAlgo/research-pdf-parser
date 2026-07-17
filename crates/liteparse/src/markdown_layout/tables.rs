@@ -462,6 +462,23 @@ fn cells_from_raw_items_with_tracks(
             .filter(|&(_, &t)| t >= x0 - tol && t <= x1 + tol)
             .map(|(i, _)| i)
             .collect();
+        // A formula atom is semantically one cell value even when its visual
+        // bbox spans several inferred tracks (wide fractions/cases are common).
+        // Never split its Markdown payload at whitespace inside alt text or
+        // LaTeX; anchor it to the leftmost covered track, matching colspan
+        // start semantics.
+        if span.is_formula_atom() {
+            let idx = covered.first().copied().or_else(|| {
+                tracks
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| (*a - x0).abs().total_cmp(&(*b - x0).abs()))
+                    .map(|(idx, _)| idx)
+            })?;
+            push_text(&mut cells[idx].text, &span.text);
+            cells[idx].end_x = cells[idx].end_x.max(x1);
+            continue;
+        }
         // For spans that cover multiple tracks (multi-column-spanning items
         // we'd want to split), the span's leftmost x must anchor at the
         // leftmost covered track within tolerance. Otherwise the item is
@@ -2472,6 +2489,544 @@ fn extract_h_v_segments(graphics: &[GraphicPrimitive]) -> (Vec<HSeg>, Vec<VSeg>)
     (hs, vs)
 }
 
+/// One horizontal rule level with every long segment kept separately. Unlike
+/// `cluster_h_segments`, this preserves the tiny gap between adjacent cell
+/// rules; repeated endpoint pairs are the only reliable column boundary in a
+/// table that draws row rules but no vertical strokes.
+#[derive(Debug, Clone)]
+struct HorizontalRuleLevel {
+    y: f32,
+    segments: Vec<HSeg>,
+}
+
+const HORIZONTAL_TABLE_MIN_RULE_WIDTH_PT: f32 = 80.0;
+const HORIZONTAL_TABLE_MIN_LEVELS: usize = 4;
+const HORIZONTAL_TABLE_MIN_ROW_HEIGHT_PT: f32 = 8.0;
+const HORIZONTAL_TABLE_MAX_ROW_HEIGHT_PT: f32 = 80.0;
+const HORIZONTAL_TABLE_RIGHT_EDGE_TOLERANCE_PT: f32 = 12.0;
+const HORIZONTAL_TABLE_ENDPOINT_TOLERANCE_PT: f32 = 4.0;
+const HORIZONTAL_TABLE_TAIL_PT: f32 = 45.0;
+
+fn median_f32(values: &[f32]) -> f32 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[sorted.len() / 2]
+}
+
+fn supported_positions(values: &[f32], tolerance: f32) -> Vec<(f32, usize)> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mut clusters: Vec<(f32, usize, f32)> = Vec::new(); // sum, count, last
+    for value in sorted {
+        match clusters.last_mut() {
+            Some((sum, count, last)) if value - *last <= tolerance => {
+                *sum += value;
+                *count += 1;
+                *last = value;
+            }
+            _ => clusters.push((value, 1, value)),
+        }
+    }
+    clusters
+        .into_iter()
+        .map(|(sum, count, _)| (sum / count as f32, count))
+        .collect()
+}
+
+fn horizontal_rule_levels(graphics: &[GraphicPrimitive]) -> Vec<HorizontalRuleLevel> {
+    let (mut hs, _) = extract_h_v_segments(graphics);
+    hs.retain(|seg| seg.x_max - seg.x_min >= HORIZONTAL_TABLE_MIN_RULE_WIDTH_PT);
+    hs.sort_by(|a, b| a.y.total_cmp(&b.y));
+    let mut levels: Vec<HorizontalRuleLevel> = Vec::new();
+    for seg in hs {
+        if let Some(level) = levels.last_mut()
+            && (level.y - seg.y).abs() <= TABLE_GRID_CLUSTER_PT
+        {
+            let n = level.segments.len() as f32;
+            level.y = (level.y * n + seg.y) / (n + 1.0);
+            level.segments.push(seg);
+        } else {
+            levels.push(HorizontalRuleLevel {
+                y: seg.y,
+                segments: vec![seg],
+            });
+        }
+    }
+    levels
+}
+
+fn horizontal_rule_groups(levels: Vec<HorizontalRuleLevel>) -> Vec<Vec<HorizontalRuleLevel>> {
+    let mut groups: Vec<Vec<HorizontalRuleLevel>> = Vec::new();
+    for level in levels {
+        let append = groups
+            .last()
+            .and_then(|group| group.last())
+            .is_some_and(|prev| {
+                let gap = level.y - prev.y;
+                let prev_right = prev
+                    .segments
+                    .iter()
+                    .map(|seg| seg.x_max)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let right = level
+                    .segments
+                    .iter()
+                    .map(|seg| seg.x_max)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                (HORIZONTAL_TABLE_MIN_ROW_HEIGHT_PT..=HORIZONTAL_TABLE_MAX_ROW_HEIGHT_PT)
+                    .contains(&gap)
+                    && (right - prev_right).abs() <= HORIZONTAL_TABLE_RIGHT_EDGE_TOLERANCE_PT
+            });
+        if append {
+            groups.last_mut().unwrap().push(level);
+        } else {
+            groups.push(vec![level]);
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|group| group.len() >= HORIZONTAL_TABLE_MIN_LEVELS)
+        .collect()
+}
+
+fn horizontal_split_positions(levels: &[HorizontalRuleLevel]) -> Vec<f32> {
+    let mut candidates = Vec::new();
+    for level in levels {
+        for left in &level.segments {
+            for right in &level.segments {
+                if left.x_min >= right.x_min {
+                    continue;
+                }
+                let gap = right.x_min - left.x_max;
+                if gap.abs() <= HORIZONTAL_TABLE_ENDPOINT_TOLERANCE_PT {
+                    candidates.push((left.x_max + right.x_min) * 0.5);
+                }
+            }
+        }
+    }
+    let min_support = 3usize.max(levels.len() / 3);
+    supported_positions(&candidates, TABLE_COL_BOUNDARY_CLUSTER_PT)
+        .into_iter()
+        .filter(|(_, support)| *support >= min_support)
+        .map(|(x, _)| x)
+        .collect()
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+        )
+    })
+}
+
+fn synthetic_horizontal_header(cells: &[Vec<String>], columns: usize) -> Vec<String> {
+    let cjk = cells.iter().flatten().any(|cell| contains_cjk(cell));
+    match (columns, cjk) {
+        (2, true) => vec!["项目".into(), "定义".into()],
+        (3, true) => vec!["分组".into(), "项目".into(), "公式与说明".into()],
+        (2, false) => vec!["Item".into(), "Definition".into()],
+        (3, false) => vec!["Group".into(), "Item".into(), "Formula / definition".into()],
+        _ => (1..=columns)
+            .map(|index| format!("Column {index}"))
+            .collect(),
+    }
+}
+
+/// Markdown cannot represent a source `rowspan`. Given the visible labels in
+/// column zero, partition all body rows into contiguous groups whose vertical
+/// centers best match those labels, then repeat each label over its group.
+/// This recovers a category centered over several sub-rows without relying on
+/// document-specific words or a hard-coded row count.
+fn repeat_rowspan_labels(grid: &mut CellGrid, row_centers: &[f32], body_start: usize) {
+    if grid.n_cols() < 3 || body_start >= grid.n_rows() {
+        return;
+    }
+    let anchors: Vec<(usize, String)> = (body_start..grid.n_rows())
+        .filter(|row| grid.has_text[*row][0])
+        .map(|row| (row - body_start, grid.text[row][0].clone()))
+        .collect();
+    let n = grid.n_rows() - body_start;
+    let k = anchors.len();
+    if k == 0 || k > n {
+        return;
+    }
+    let centers = &row_centers[body_start..];
+    let mut prefix = vec![0.0f32; n + 1];
+    for (index, center) in centers.iter().enumerate() {
+        prefix[index + 1] = prefix[index] + center;
+    }
+    let mut dp = vec![vec![f32::INFINITY; n + 1]; k + 1];
+    let mut prev = vec![vec![None; n + 1]; k + 1];
+    dp[0][0] = 0.0;
+    for group in 1..=k {
+        let anchor_row = anchors[group - 1].0;
+        let anchor_y = centers[anchor_row];
+        for end in group..=n {
+            for start in (group - 1)..end {
+                if !dp[group - 1][start].is_finite() || anchor_row < start || anchor_row >= end {
+                    continue;
+                }
+                let mean = (prefix[end] - prefix[start]) / (end - start) as f32;
+                let cost = dp[group - 1][start] + (mean - anchor_y).powi(2);
+                if cost < dp[group][end] {
+                    dp[group][end] = cost;
+                    prev[group][end] = Some(start);
+                }
+            }
+        }
+    }
+    if !dp[k][n].is_finite() {
+        return;
+    }
+    let mut ranges = vec![(0usize, 0usize); k];
+    let mut end = n;
+    for group in (1..=k).rev() {
+        let Some(start) = prev[group][end] else {
+            return;
+        };
+        ranges[group - 1] = (start, end);
+        end = start;
+    }
+    for ((start, end), (_, label)) in ranges.into_iter().zip(anchors) {
+        for row in start..end {
+            grid.text[body_start + row][0] = label.clone();
+            grid.has_text[body_start + row][0] = true;
+            grid.is_bold[body_start + row][0] = false;
+        }
+    }
+}
+
+fn compact_spaced_ascii_run(text: &str) -> String {
+    let trimmed = text.trim();
+    let compactable = !trimmed.is_empty()
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() || matches!(ch, '_' | '-')
+        });
+    if compactable && trimmed.chars().any(char::is_whitespace) {
+        trimmed.chars().filter(|ch| !ch.is_whitespace()).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_ascii_formula_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() || matches!(ch, '_' | '-')
+        })
+}
+
+/// Formula tables often project prose-baseline variables and their lowered
+/// subscripts as separate lines. Reassemble only cells that already contain a
+/// FormulaAtom by x position, attaching small adjacent script glyphs to their
+/// base token. This preserves normal table behavior while preventing `e ... i`
+/// or sentence-final `t t` artifacts in formula-definition cells.
+fn reorder_horizontal_formula_cells(
+    grid: &mut CellGrid,
+    lines: &[ProjectedLine],
+    xs: &[f32],
+    ys: &[f32],
+) {
+    let mut spans = vec![vec![Vec::<&TextItem>::new(); grid.n_cols()]; grid.n_rows()];
+    for span in lines.iter().flat_map(|line| &line.spans) {
+        if span.text.trim().is_empty() {
+            continue;
+        }
+        let cy = span.y + span.height * 0.5;
+        let cx = span.x + span.width * 0.5;
+        let Some(row) = find_bucket(ys, cy) else {
+            continue;
+        };
+        let Some(col) = find_bucket(xs, cx) else {
+            continue;
+        };
+        if row < grid.n_rows() && col < grid.n_cols() {
+            spans[row][col].push(span);
+        }
+    }
+
+    for (row, row_spans) in spans.iter_mut().enumerate() {
+        for (col, cell_spans) in row_spans.iter_mut().enumerate() {
+            if !cell_spans.iter().any(|span| span.is_formula_atom()) {
+                continue;
+            }
+            let mut rendered = String::new();
+            cell_spans.sort_by(|left, right| {
+                let left_center = left.y + left.height * 0.5;
+                let right_center = right.y + right.height * 0.5;
+                left_center.total_cmp(&right_center)
+            });
+            let mut baselines: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+            for span in cell_spans.iter().copied() {
+                let center = span.y + span.height * 0.5;
+                if let Some((mean, members)) = baselines.last_mut()
+                    && (center - *mean).abs() <= 7.0
+                {
+                    *mean = (*mean * members.len() as f32 + center) / (members.len() + 1) as f32;
+                    members.push(span);
+                } else {
+                    baselines.push((center, vec![span]));
+                }
+            }
+            for (_, members) in &mut baselines {
+                members.sort_by(|left, right| left.x.total_cmp(&right.x));
+                if !rendered.is_empty() && !rendered.ends_with(' ') {
+                    rendered.push(' ');
+                }
+                let mut previous: Option<&TextItem> = None;
+                for span in members.iter().copied() {
+                    let text = if span.is_formula_atom() {
+                        span.text.trim().to_string()
+                    } else {
+                        compact_spaced_ascii_run(&span.text)
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if let Some(prev) = previous {
+                        let gap = span.x - (prev.x + prev.width);
+                        let prev_center = prev.y + prev.height * 0.5;
+                        let center = span.y + span.height * 0.5;
+                        let script = !prev.is_formula_atom()
+                            && !span.is_formula_atom()
+                            && is_ascii_formula_fragment(&prev.text)
+                            && is_ascii_formula_fragment(&span.text)
+                            && span.height <= prev.height * 0.75
+                            && gap <= 3.0
+                            && (center - prev_center).abs() >= prev.height * 0.2;
+                        if script {
+                            rendered.push(if center < prev_center { '^' } else { '_' });
+                        } else {
+                            let join_ascii = !prev.is_formula_atom()
+                                && !span.is_formula_atom()
+                                && is_ascii_formula_fragment(&prev.text)
+                                && is_ascii_formula_fragment(&span.text)
+                                && gap <= 4.0;
+                            if !join_ascii && !rendered.ends_with(' ') {
+                                rendered.push(' ');
+                            }
+                        }
+                    }
+                    rendered.push_str(&text);
+                    previous = Some(span);
+                }
+            }
+            grid.text[row][col] = collapse_whitespace(&rendered);
+            grid.repl[row][col] = grid.text[row][col].clone();
+            grid.has_text[row][col] = !grid.text[row][col].is_empty();
+            grid.is_bold[row][col] = false;
+        }
+    }
+}
+
+fn build_horizontal_formula_table(
+    levels: &[HorizontalRuleLevel],
+    lines: &[ProjectedLine],
+) -> Option<(TableRun, Vec<usize>)> {
+    let right = median_f32(
+        &levels
+            .iter()
+            .map(|level| {
+                level
+                    .segments
+                    .iter()
+                    .map(|seg| seg.x_max)
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let rule_left = median_f32(
+        &levels
+            .iter()
+            .map(|level| {
+                level
+                    .segments
+                    .iter()
+                    .map(|seg| seg.x_min)
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let first_y = levels.first()?.y;
+    let last_y = levels.last()?.y;
+
+    let tail_items: Vec<&TextItem> = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| {
+            let cy = span.y + span.height * 0.5;
+            cy > last_y + 1.0
+                && cy <= last_y + HORIZONTAL_TABLE_TAIL_PT
+                && span.x < right + 6.0
+                && !span.text.trim().is_empty()
+        })
+        .collect();
+    let has_tail_formula = tail_items.iter().any(|span| span.is_formula_atom());
+    let tail_bottom = if tail_items.len() >= 2 || has_tail_formula {
+        tail_items
+            .iter()
+            .map(|span| span.y + span.height)
+            .fold(last_y, f32::max)
+            + 2.0
+    } else {
+        last_y
+    };
+    let mut ys: Vec<f32> = levels.iter().map(|level| level.y).collect();
+    if tail_bottom > last_y + HORIZONTAL_TABLE_MIN_ROW_HEIGHT_PT {
+        ys.push(tail_bottom.min(last_y + HORIZONTAL_TABLE_TAIL_PT));
+    }
+
+    let content_items: Vec<&TextItem> = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| {
+            let cy = span.y + span.height * 0.5;
+            cy >= first_y
+                && cy <= *ys.last().unwrap()
+                && span.x < right + 6.0
+                && !span.text.trim().is_empty()
+        })
+        .collect();
+    if !content_items.iter().any(|span| span.is_formula_atom()) {
+        return None;
+    }
+    let content_left = content_items
+        .iter()
+        .map(|span| span.x)
+        .fold(f32::INFINITY, f32::min);
+    let explicit_splits = horizontal_split_positions(levels);
+    let mut xs = vec![(content_left.min(rule_left) - 2.0).max(0.0)];
+    let partial_left = explicit_splits.is_empty() && rule_left - content_left >= 25.0;
+    if partial_left {
+        let starts: Vec<f32> = content_items
+            .iter()
+            .filter(|span| span.x + span.width <= rule_left + 3.0 && span.x < rule_left - 8.0)
+            .map(|span| span.x)
+            .collect();
+        let supported: Vec<(f32, usize)> = supported_positions(&starts, 12.0)
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .collect();
+        let first = supported.first()?.0;
+        let last = supported.last()?.0;
+        if last - first < 25.0 {
+            return None;
+        }
+        let first_right = content_items
+            .iter()
+            .filter(|span| (span.x - first).abs() <= 12.0 && span.x + span.width < rule_left)
+            .map(|span| span.x + span.width)
+            .fold(first, f32::max);
+        xs.push((first_right + last) * 0.5);
+        xs.push(rule_left);
+    } else {
+        xs.extend(explicit_splits);
+    }
+    xs.push(right + 2.0);
+    xs.sort_by(|a, b| a.total_cmp(b));
+    dedup_close(&mut xs, TABLE_COL_BOUNDARY_CLUSTER_PT);
+    if xs.len() < 3 || xs.windows(2).any(|window| window[1] - window[0] < 15.0) {
+        return None;
+    }
+
+    let (mut grid, consumed) = assign_cells(lines, &xs, &ys, false)?;
+    reorder_horizontal_formula_cells(&mut grid, lines, &xs, &ys);
+    let keep_rows: Vec<bool> = grid
+        .has_text
+        .iter()
+        .map(|row| row.iter().any(|filled| *filled))
+        .collect();
+    let mut row_centers: Vec<f32> = ys
+        .windows(2)
+        .map(|pair| (pair[0] + pair[1]) * 0.5)
+        .collect();
+    row_centers = filter_by(row_centers, &keep_rows);
+    grid.retain_rows(&keep_rows);
+    if grid.n_rows() < 3 {
+        return None;
+    }
+    let columns = grid.n_cols();
+    let first_filled = grid.has_text[0].iter().filter(|filled| **filled).count();
+    let first_all_bold = grid.has_text[0]
+        .iter()
+        .zip(grid.is_bold[0].iter())
+        .all(|(filled, bold)| !*filled || *bold);
+    let first_short_labels = first_filled == columns
+        && grid.text[0].iter().all(|cell| {
+            let text = cell.trim();
+            !text.is_empty()
+                && text.chars().count() <= 20
+                && !text.contains("formula_")
+                && !text.contains('$')
+                && !text.contains('`')
+        });
+    let first_is_header = first_filled >= 2 && (first_all_bold || first_short_labels);
+    let body_start = usize::from(first_is_header);
+    if partial_left {
+        repeat_rowspan_labels(&mut grid, &row_centers, body_start);
+    }
+    let dense_rows = (body_start..grid.n_rows())
+        .filter(|row| grid.has_text[*row].iter().filter(|filled| **filled).count() >= 2)
+        .count();
+    let body_count = grid.n_rows() - body_start;
+    if body_count < 2 || dense_rows * 4 < body_count * 3 {
+        return None;
+    }
+
+    let header = if first_is_header {
+        Some(grid.text[0].clone())
+    } else {
+        Some(synthetic_horizontal_header(&grid.text, columns))
+    };
+    let rows = grid.text[body_start..].to_vec();
+    let start = *consumed.iter().min()?;
+    let end = consumed.iter().max()? + 1;
+    Some((
+        TableRun {
+            start,
+            end,
+            body_start: start,
+            block: Block::Table { header, rows },
+        },
+        consumed,
+    ))
+}
+
+/// Page-level recovery for formula tables that draw horizontal row rules but
+/// omit vertical separators. It is intentionally FormulaAtom-gated: the first
+/// native probe and ordinary documents keep the upstream table behavior, while
+/// the final formula-aware Grid gets a geometry-backed reconstruction.
+pub(super) fn detect_horizontal_formula_tables_global(
+    lines: &[ProjectedLine],
+    graphics: &[GraphicPrimitive],
+) -> Vec<(TableRun, Vec<usize>)> {
+    let (_, vs) = extract_h_v_segments(graphics);
+    let mut out = Vec::new();
+    for levels in horizontal_rule_groups(horizontal_rule_levels(graphics)) {
+        let top = levels.first().unwrap().y;
+        let bottom = levels.last().unwrap().y;
+        let height = (bottom - top).max(1.0);
+        let crossing_verticals = vs
+            .iter()
+            .filter(|line| (line.y_max.min(bottom) - line.y_min.max(top)).max(0.0) >= height * 0.7)
+            .count();
+        if crossing_verticals >= 2 {
+            continue;
+        }
+        if let Some(table) = build_horizontal_formula_table(&levels, lines) {
+            out.push(table);
+        }
+    }
+    out.sort_by_key(|(run, _)| run.start);
+    out
+}
+
 /// Cluster H segments sharing a y-coordinate (within `TABLE_GRID_CLUSTER_PT`)
 /// into a single wider grid line whose x-extent is the union of the inputs.
 fn cluster_h_segments(mut segs: Vec<HSeg>) -> Vec<HSeg> {
@@ -2880,6 +3435,19 @@ fn assign_cells(
             let sx1 = (span.x + span.width).clamp(xs[0], xs[n_cols]);
             let c_lo = find_bucket(xs, sx0).unwrap_or(0);
             let c_hi = find_bucket(xs, sx1).unwrap_or(n_cols - 1);
+            // Formula atoms are indivisible table-cell values. Their bbox may
+            // cross ruled boundaries (fractions and cases frequently do), but
+            // splitting the Markdown string at whitespace corrupts the atom
+            // and can make it disappear during sparse-column collapse.
+            if span.is_formula_atom() {
+                let cx = (span.x + span.width * 0.5).clamp(xs[0], xs[n_cols]);
+                let col = find_bucket(xs, cx).unwrap_or(c_lo);
+                grid.push_text(row, col, &span.text);
+                grid.push_repl(row, col, &span.text);
+                grid.is_bold[row][col] = false;
+                span_total += 1;
+                continue;
+            }
             span_total += 1;
             {
                 let m0 = (span.x + STRADDLE_MARGIN_PT).clamp(xs[0], xs[n_cols]);
@@ -3659,15 +4227,137 @@ pub(super) fn merge_table_runs(
 /// stays valid. Newlines should be impossible inside a single cell (we built
 /// cells from spans on the same projected line) but guard anyway.
 pub(super) fn escape_table_cell(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace('\n', " ")
+    s.replace('|', "\\|").replace('\n', " ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{line, line_with_spans, rect_borders, stroke};
     use super::*;
+    use crate::types::TextItemKind;
+
+    fn mark_formula(line: &mut ProjectedLine, text: &str) {
+        let span = line
+            .spans
+            .iter_mut()
+            .find(|span| span.text == text)
+            .expect("formula fixture span");
+        span.kind = TextItemKind::FormulaAtom {
+            id: format!("formula-{}", span.y),
+            source: "test".into(),
+        };
+    }
+
+    #[test]
+    fn horizontal_formula_table_recovers_two_columns_without_vertical_rules() {
+        let mut rows = vec![
+            line_with_spans(&[("OPEN", 70.0), ("开盘价", 200.0)], 92.0, 10.0),
+            line_with_spans(
+                &[("DELTA(A,n)", 70.0), ("$A_i-A_{i-n}$", 200.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(&[("SUM(A,n)", 70.0), ("过去 n 天求和", 200.0)], 132.0, 10.0),
+        ];
+        mark_formula(&mut rows[1], "$A_i-A_{i-n}$");
+        let mut graphics = Vec::new();
+        for y in [90.0, 110.0, 130.0, 150.0] {
+            graphics.push(stroke(50.0, y, 150.0, y, 0.5));
+            graphics.push(stroke(151.0, y, 400.0, y, 0.5));
+        }
+
+        let detected = detect_horizontal_formula_tables_global(&rows, &graphics);
+        assert_eq!(detected.len(), 1);
+        match &detected[0].0.block {
+            Block::Table { header, rows } => {
+                assert_eq!(header.as_ref().unwrap(), &vec!["OPEN", "开盘价"]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], "DELTA(A,n)");
+                assert!(rows[0][1].contains("$A_i-A_{i-n}$"));
+            }
+            other => panic!("expected formula table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn horizontal_formula_table_orders_prose_scripts_by_x() {
+        let mut formula_row = line_with_spans(
+            &[
+                ("DELTA(A,n)", 70.0),
+                ("$F$", 200.0),
+                ("其中", 250.0),
+                ("V", 280.0),
+                ("表示成交量", 300.0),
+            ],
+            112.0,
+            10.0,
+        );
+        mark_formula(&mut formula_row, "$F$");
+        let script_row = line_with_spans(&[("t", 285.0)], 118.0, 4.0);
+        let rows = vec![
+            line_with_spans(&[("OPEN", 70.0), ("开盘价", 200.0)], 92.0, 10.0),
+            formula_row,
+            script_row,
+            line_with_spans(&[("SUM(A,n)", 70.0), ("过去 n 天求和", 200.0)], 132.0, 10.0),
+        ];
+        let mut graphics = Vec::new();
+        for y in [90.0, 110.0, 130.0, 150.0] {
+            graphics.push(stroke(50.0, y, 150.0, y, 0.5));
+            graphics.push(stroke(151.0, y, 400.0, y, 0.5));
+        }
+
+        let detected = detect_horizontal_formula_tables_global(&rows, &graphics);
+        let Block::Table { rows, .. } = &detected[0].0.block else {
+            panic!("expected table")
+        };
+        assert_eq!(rows[0][1], "$F$ 其中 V_t 表示成交量");
+    }
+
+    #[test]
+    fn horizontal_formula_table_repeats_rowspan_categories() {
+        let mut rows = vec![
+            line_with_spans(&[("A1", 110.0), ("$a_1$", 170.0)], 92.0, 10.0),
+            line_with_spans(
+                &[("Category A", 50.0), ("A2", 110.0), ("$a_2$", 170.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(&[("A3", 110.0), ("$a_3$", 170.0)], 132.0, 10.0),
+            line_with_spans(&[("B1", 110.0), ("$b_1$", 170.0)], 152.0, 10.0),
+            line_with_spans(
+                &[("Category B", 50.0), ("B2", 110.0), ("$b_2$", 170.0)],
+                172.0,
+                10.0,
+            ),
+            line_with_spans(&[("B3", 110.0), ("$b_3$", 170.0)], 192.0, 10.0),
+        ];
+        for (line, formula) in rows
+            .iter_mut()
+            .zip(["$a_1$", "$a_2$", "$a_3$", "$b_1$", "$b_2$", "$b_3$"])
+        {
+            mark_formula(line, formula);
+        }
+        let graphics: Vec<_> = [90.0, 110.0, 130.0, 150.0, 170.0, 190.0, 210.0]
+            .into_iter()
+            .map(|y| stroke(150.0, y, 400.0, y, 0.5))
+            .collect();
+
+        let detected = detect_horizontal_formula_tables_global(&rows, &graphics);
+        assert_eq!(detected.len(), 1);
+        match &detected[0].0.block {
+            Block::Table { header, rows } => {
+                assert_eq!(header.as_ref().unwrap().len(), 3);
+                assert_eq!(rows.len(), 6);
+                assert_eq!(rows[0][0], "Category A");
+                assert_eq!(rows[1][0], "Category A");
+                assert_eq!(rows[2][0], "Category A");
+                assert_eq!(rows[3][0], "Category B");
+                assert_eq!(rows[4][0], "Category B");
+                assert_eq!(rows[5][0], "Category B");
+            }
+            other => panic!("expected formula table, got {other:?}"),
+        }
+    }
 
     #[test]
     fn split_cells_splits_on_wide_gaps() {

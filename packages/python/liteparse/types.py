@@ -32,6 +32,41 @@ class TextItem:
     #: Per-word sub-boxes. Empty unless the parser was configured with
     #: ``emit_word_boxes=True``.
     words: List[WordBox] = field(default_factory=list)
+    #: Stable id when this item is an injected pre-grid formula atom.
+    formula_atom_id: Optional[str] = None
+
+
+@dataclass
+class FormulaCandidate:
+    """A formula-shaped native PDF region detected before grid projection.
+
+    ``route`` is either ``"native_text"`` or ``"vision"``. Coordinates use
+    the same top-left, 72-DPI viewport space as :class:`TextItem`.
+    """
+    id: str
+    x: float
+    y: float
+    width: float
+    height: float
+    route: str
+    text: str
+    confidence: float
+    reasons: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FormulaAtom:
+    """A validated, indivisible Markdown formula injected before final Grid."""
+
+    id: str
+    page_num: int
+    x: float
+    y: float
+    width: float
+    height: float
+    markdown: str
+    confidence: float = 1.0
+    source: str = "validated"
 
 
 @dataclass
@@ -43,6 +78,8 @@ class ParsedPage:
     text: str
     markdown: str = ""
     text_items: List[TextItem] = field(default_factory=list)
+    formula_candidates: List[FormulaCandidate] = field(default_factory=list)
+    formula_atoms: List[FormulaAtom] = field(default_factory=list)
 
 
 @dataclass

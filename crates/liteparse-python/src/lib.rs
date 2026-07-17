@@ -75,6 +75,9 @@ struct PyTextItem {
     /// configured with `emit_word_boxes=True`.
     #[pyo3(get)]
     words: Vec<PyWordBox>,
+    /// Stable formula id when this item is an injected semantic atom.
+    #[pyo3(get)]
+    formula_atom_id: Option<String>,
 }
 
 #[pymethods]
@@ -104,6 +107,10 @@ impl PyTextItem {
     }
 
     fn from_rust(item: liteparse::types::TextItem) -> Self {
+        let formula_atom_id = match &item.kind {
+            liteparse::types::TextItemKind::FormulaAtom { id, .. } => Some(id.clone()),
+            liteparse::types::TextItemKind::Text => None,
+        };
         Self {
             text: item.text,
             x: item.x as f64,
@@ -115,6 +122,147 @@ impl PyTextItem {
             confidence: item.confidence.map(|v| v as f64).or(Some(1.0)),
             rotation: item.rotation as f64,
             words: item.words.into_iter().map(PyWordBox::from_rust).collect(),
+            formula_atom_id,
+        }
+    }
+}
+
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+struct PyFormulaCandidate {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    x: f64,
+    #[pyo3(get)]
+    y: f64,
+    #[pyo3(get)]
+    width: f64,
+    #[pyo3(get)]
+    height: f64,
+    #[pyo3(get)]
+    route: String,
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    confidence: f64,
+    #[pyo3(get)]
+    reasons: Vec<String>,
+}
+
+#[pymethods]
+impl PyFormulaCandidate {
+    fn __repr__(&self) -> String {
+        format!(
+            "FormulaCandidate(id={:?}, route={:?}, x={}, y={}, width={}, height={})",
+            self.id, self.route, self.x, self.y, self.width, self.height
+        )
+    }
+}
+
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+struct PyFormulaAtom {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    page_num: u32,
+    #[pyo3(get)]
+    x: f64,
+    #[pyo3(get)]
+    y: f64,
+    #[pyo3(get)]
+    width: f64,
+    #[pyo3(get)]
+    height: f64,
+    #[pyo3(get)]
+    markdown: String,
+    #[pyo3(get)]
+    confidence: f64,
+    #[pyo3(get)]
+    source: String,
+}
+
+#[pymethods]
+impl PyFormulaAtom {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: String,
+        page_num: u32,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        markdown: String,
+        confidence: f64,
+        source: String,
+    ) -> Self {
+        Self {
+            id,
+            page_num,
+            x,
+            y,
+            width,
+            height,
+            markdown,
+            confidence,
+            source,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FormulaAtom(id={:?}, page_num={}, x={}, y={}, width={}, height={}, source={:?})",
+            self.id, self.page_num, self.x, self.y, self.width, self.height, self.source
+        )
+    }
+}
+
+impl PyFormulaAtom {
+    fn to_rust(&self) -> liteparse::types::FormulaAtom {
+        liteparse::types::FormulaAtom {
+            id: self.id.clone(),
+            page_number: self.page_num as usize,
+            bbox: liteparse::types::Rect {
+                x: self.x as f32,
+                y: self.y as f32,
+                width: self.width as f32,
+                height: self.height as f32,
+            },
+            markdown: self.markdown.clone(),
+            confidence: self.confidence as f32,
+            source: self.source.clone(),
+        }
+    }
+
+    fn from_rust(atom: liteparse::types::FormulaAtom) -> Self {
+        Self {
+            id: atom.id,
+            page_num: atom.page_number as u32,
+            x: atom.bbox.x as f64,
+            y: atom.bbox.y as f64,
+            width: atom.bbox.width as f64,
+            height: atom.bbox.height as f64,
+            markdown: atom.markdown,
+            confidence: atom.confidence as f64,
+            source: atom.source,
+        }
+    }
+}
+
+impl PyFormulaCandidate {
+    fn from_rust(candidate: liteparse::types::FormulaCandidate) -> Self {
+        Self {
+            id: candidate.id,
+            x: candidate.bbox.x as f64,
+            y: candidate.bbox.y as f64,
+            width: candidate.bbox.width as f64,
+            height: candidate.bbox.height as f64,
+            route: candidate.route.as_str().into(),
+            text: candidate.text,
+            confidence: candidate.confidence as f64,
+            reasons: candidate.reasons,
         }
     }
 }
@@ -134,6 +282,10 @@ struct PyParsedPage {
     markdown: String,
     #[pyo3(get)]
     text_items: Vec<PyTextItem>,
+    #[pyo3(get)]
+    formula_candidates: Vec<PyFormulaCandidate>,
+    #[pyo3(get)]
+    formula_atoms: Vec<PyFormulaAtom>,
 }
 
 #[pymethods]
@@ -161,6 +313,16 @@ impl PyParsedPage {
                 .text_items
                 .into_iter()
                 .map(PyTextItem::from_rust)
+                .collect(),
+            formula_candidates: page
+                .formula_candidates
+                .into_iter()
+                .map(PyFormulaCandidate::from_rust)
+                .collect(),
+            formula_atoms: page
+                .formula_atoms
+                .into_iter()
+                .map(PyFormulaAtom::from_rust)
                 .collect(),
         }
     }
@@ -585,6 +747,43 @@ impl LiteParse {
         Ok(PyParseResult::from_rust(result))
     }
 
+    /// Reparse a document and inject validated formula atoms before the final
+    /// grid projection.
+    fn parse_with_formula_atoms(
+        &self,
+        py: Python<'_>,
+        input: String,
+        atoms: Vec<PyFormulaAtom>,
+    ) -> PyResult<PyParseResult> {
+        let pdf_input = PdfInput::Path(input);
+        let atoms = atoms.iter().map(PyFormulaAtom::to_rust).collect();
+        let result = py
+            .detach(|| {
+                self.runtime
+                    .block_on(self.inner.parse_input_with_formula_atoms(pdf_input, atoms))
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(PyParseResult::from_rust(result))
+    }
+
+    /// Bytes counterpart of `parse_with_formula_atoms`.
+    fn parse_bytes_with_formula_atoms(
+        &self,
+        py: Python<'_>,
+        data: Vec<u8>,
+        atoms: Vec<PyFormulaAtom>,
+    ) -> PyResult<PyParseResult> {
+        let pdf_input = PdfInput::Bytes(data);
+        let atoms = atoms.iter().map(PyFormulaAtom::to_rust).collect();
+        let result = py
+            .detach(|| {
+                self.runtime
+                    .block_on(self.inner.parse_input_with_formula_atoms(pdf_input, atoms))
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(PyParseResult::from_rust(result))
+    }
+
     /// Determine per-page complexity for a document at the given path. Returns
     /// a list of PageComplexityStats — a cheap pre-OCR check with per-page
     /// signals and a `needs_ocr` verdict.
@@ -685,6 +884,8 @@ fn _liteparse(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExtractedImage>()?;
     m.add_class::<PyParsedPage>()?;
     m.add_class::<PyTextItem>()?;
+    m.add_class::<PyFormulaCandidate>()?;
+    m.add_class::<PyFormulaAtom>()?;
     m.add_class::<PyWordBox>()?;
     m.add_class::<PyScreenshotResult>()?;
     m.add_class::<PyPageComplexityStats>()?;

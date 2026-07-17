@@ -227,6 +227,27 @@ pub fn classify_page_with_filters(
         global_ruled_tables.push((top_y, run.block));
         global_ruled_consumed.extend(consumed);
     }
+    // Some financial appendices rule every row but omit vertical separators.
+    // The ordinary ruled detector cannot form an H/V component and XY-cut may
+    // scatter the formula/description cells across leaves. Recover only final
+    // Grid tables that already contain FormulaAtoms; regular parsing remains
+    // on the upstream borderless/ruled paths.
+    for (run, consumed) in
+        super::tables::detect_horizontal_formula_tables_global(lines, &page.graphics)
+    {
+        if consumed
+            .iter()
+            .any(|index| global_ruled_consumed.contains(index))
+        {
+            continue;
+        }
+        let top_y = consumed
+            .iter()
+            .map(|&index| lines[index].bbox.y)
+            .fold(f32::INFINITY, f32::min);
+        global_ruled_tables.push((top_y, run.block));
+        global_ruled_consumed.extend(consumed);
+    }
     let global_ruled_owned: Option<Vec<ProjectedLine>> = if global_ruled_consumed.is_empty() {
         None
     } else {
@@ -591,6 +612,30 @@ fn classify_region(
         }
         // Any non-mono line ends the current code block (if any).
         state.flush_code(&mut blocks);
+
+        // A standalone formula atom is already fully validated Markdown. Keep
+        // it out of heading/list/paragraph heuristics so no later pass escapes,
+        // joins, or reclassifies it. Formula atoms inside tables were consumed
+        // by the table run above; mixed prose + inline formula continues through
+        // `render_line_inline`, which preserves only the tagged atom verbatim.
+        let formula_spans: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| !span.text.trim().is_empty())
+            .collect();
+        if !formula_spans.is_empty() && formula_spans.iter().all(|span| span.is_formula_atom()) {
+            state.flush_paragraph(&mut blocks);
+            state.reset_list();
+            heading_run = None;
+            blocks.push(Block::FormulaAtom {
+                markdown: formula_spans
+                    .iter()
+                    .map(|span| span.text.trim())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            });
+            continue;
+        }
 
         // Decorative divider / flourish lines (`* * * *`, a lone em-dash).
         // Handled before heading/paragraph classification so the ornament
@@ -971,7 +1016,110 @@ fn classify_region(
     state.flush_code(&mut blocks);
     // Flush any trailing interruptions that sat below the last text line.
     state.emit_before(&mut blocks, &mut interruptions, f32::INFINITY);
+    restore_missing_formula_atoms(&mut blocks, lines);
     blocks
+}
+
+/// Table re-clustering may rebuild rows from inferred tracks and accidentally
+/// omit a sparse cell. Ordinary text has several recovery paths; a formula
+/// atom must have a stronger invariant: once injected, its trusted payload is
+/// never dropped. Prefer restoring it beside the matching row label inside an
+/// existing table; if no row can be matched, emit a standalone contextual
+/// formula block at the end of this layout region.
+fn restore_missing_formula_atoms(blocks: &mut Vec<Block>, lines: &[ProjectedLine]) {
+    let mut atoms: Vec<(&crate::types::TextItem, Vec<&crate::types::TextItem>)> = Vec::new();
+    for line in lines {
+        let context: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| !span.is_formula_atom() && !span.text.trim().is_empty())
+            .collect();
+        for atom in line
+            .spans
+            .iter()
+            .filter(|span| span.is_formula_atom() && !span.text.trim().is_empty())
+        {
+            atoms.push((atom, context.clone()));
+        }
+    }
+
+    for (atom, context) in atoms {
+        let payload = atom.text.trim();
+        if blocks.iter().any(|block| block_contains(block, payload)) {
+            continue;
+        }
+
+        let mut restored = false;
+        'tables: for block in blocks.iter_mut() {
+            let Block::Table { header, rows } = block else {
+                continue;
+            };
+            let mut table_rows: Vec<&mut Vec<String>> = Vec::new();
+            if let Some(header) = header.as_mut() {
+                table_rows.push(header);
+            }
+            table_rows.extend(rows.iter_mut());
+            for row in table_rows {
+                for ctx in &context {
+                    let label = collapse_whitespace(ctx.text.trim());
+                    if label.is_empty() {
+                        continue;
+                    }
+                    if let Some(index) = row.iter().position(|cell| cell.contains(&label)) {
+                        let target = if atom.x > ctx.x && index + 1 < row.len() {
+                            index + 1
+                        } else {
+                            index
+                        };
+                        if !row[target].is_empty() {
+                            row[target].push(' ');
+                        }
+                        row[target].push_str(payload);
+                        restored = true;
+                        break 'tables;
+                    }
+                }
+            }
+        }
+        if restored {
+            continue;
+        }
+
+        let label = context
+            .iter()
+            .map(|span| collapse_whitespace(span.text.trim()))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let markdown = if label.is_empty() {
+            payload.to_string()
+        } else {
+            format!(
+                "**{}**\n\n{}",
+                super::inline::escape_inline(&label),
+                payload
+            )
+        };
+        blocks.push(Block::FormulaAtom { markdown });
+    }
+}
+
+fn block_contains(block: &Block, needle: &str) -> bool {
+    match block {
+        Block::Heading { text, .. }
+        | Block::Paragraph { text, .. }
+        | Block::ListItem { text, .. } => text.contains(needle),
+        Block::CodeBlock { lines, .. } | Block::GridFallback { lines } => {
+            lines.iter().any(|line| line.contains(needle))
+        }
+        Block::Table { header, rows } => header
+            .iter()
+            .flatten()
+            .chain(rows.iter().flatten())
+            .any(|cell| cell.contains(needle)),
+        Block::FormulaAtom { markdown } => markdown.contains(needle),
+        Block::HorizontalRule | Block::Figure { .. } => false,
+    }
 }
 
 /// Classify a line that is *purely decorative* — no alphanumeric content, made

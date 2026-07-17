@@ -92,6 +92,8 @@ mod tests {
             text: "txt".into(),
             markdown: String::new(),
             text_items: items,
+            formula_candidates: vec![],
+            formula_atoms: vec![],
             projected_lines: vec![],
             regions: crate::types::Region::default(),
             graphics: vec![],

@@ -45,6 +45,12 @@ pub enum Block {
     GridFallback {
         lines: Vec<String>,
     },
+    /// Caller-validated Markdown carried by one indivisible pre-grid formula
+    /// atom. Emitted verbatim; validation and delimiter choice happened before
+    /// the atom entered LiteParse.
+    FormulaAtom {
+        markdown: String,
+    },
     /// A horizontal rule detected from a long thin horizontal stroke in the
     /// page's vector graphics (e.g. divider line between sections).
     HorizontalRule,
@@ -214,6 +220,9 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                     out.push('\n');
                 }
                 out.push_str("```");
+            }
+            Block::FormulaAtom { markdown } => {
+                out.push_str(markdown.trim());
             }
             Block::CodeBlock { lines, lang } => {
                 // Pick a fence that doesn't appear inside the body. Standard

@@ -4,10 +4,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from liteparse._liteparse import LiteParse as _NativeLiteParse
+from liteparse._liteparse import PyFormulaAtom as _NativeFormulaAtom
 from liteparse._liteparse import search_items as _native_search_items
 
 from .types import (
     ExtractedImage,
+    FormulaCandidate,
+    FormulaAtom,
     LiteParseConfig,
     PageComplexityStats,
     ParsedPage,
@@ -34,6 +37,7 @@ def _convert_native_result(native_result: Any) -> ParseResult:
                 font_size=item.font_size,
                 confidence=item.confidence,
                 rotation=getattr(item, "rotation", 0.0),
+                formula_atom_id=getattr(item, "formula_atom_id", None),
                 words=[
                     WordBox(
                         text=w.text,
@@ -55,6 +59,34 @@ def _convert_native_result(native_result: Any) -> ParseResult:
                 text=native_page.text,
                 markdown=native_page.markdown,
                 text_items=text_items,
+                formula_candidates=[
+                    FormulaCandidate(
+                        id=candidate.id,
+                        x=candidate.x,
+                        y=candidate.y,
+                        width=candidate.width,
+                        height=candidate.height,
+                        route=candidate.route,
+                        text=candidate.text,
+                        confidence=candidate.confidence,
+                        reasons=list(candidate.reasons),
+                    )
+                    for candidate in getattr(native_page, "formula_candidates", [])
+                ],
+                formula_atoms=[
+                    FormulaAtom(
+                        id=atom.id,
+                        page_num=atom.page_num,
+                        x=atom.x,
+                        y=atom.y,
+                        width=atom.width,
+                        height=atom.height,
+                        markdown=atom.markdown,
+                        confidence=atom.confidence,
+                        source=atom.source,
+                    )
+                    for atom in getattr(native_page, "formula_atoms", [])
+                ],
             )
         )
     images = [
@@ -114,8 +146,14 @@ class LiteParse:
         Initialize LiteParse parser.
 
         Args:
-            ocr_enabled: Whether to enable OCR for scanned documents (default: True)
-            ocr_server_url: URL of HTTP OCR server (uses Tesseract if not provided)
+            ocr_enabled: Whether to enable OCR for scanned documents. The
+                default follows the native extension build: True only when the
+                built-in Tesseract feature is compiled in, otherwise False.
+                This fixed native-vector fork is built without Tesseract, so
+                its default is False; enabling OCR requires an OCR server URL.
+            ocr_server_url: URL of an HTTP OCR server. If omitted, LiteParse
+                uses built-in Tesseract only when that feature was compiled in;
+                otherwise enabling OCR raises a configuration error.
             ocr_server_headers: Extra HTTP headers sent with every request to
                 ``ocr_server_url`` (e.g. ``{"Authorization": "Bearer <token>"}``)
             ocr_language: Language code for OCR (e.g., "eng", "fra")
@@ -224,6 +262,47 @@ class LiteParse:
                 if not file_path.exists():
                     raise FileNotFoundError(f"File not found: {file_path}")
                 native_result = self._native.parse(str(file_path.absolute()))
+            return _convert_native_result(native_result)
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            raise ParseError(str(e)) from e
+
+    def parse_with_formula_atoms(
+        self,
+        file_data: Union[str, Path, bytes],
+        atoms: List[FormulaAtom],
+    ) -> ParseResult:
+        """Reparse and inject validated formula atoms before final Grid.
+
+        Atom bboxes must come from a previous parse of the same selected pages.
+        Overlapping atoms, duplicate ids, and atoms targeting unparsed pages are
+        rejected instead of being applied in an order-dependent way.
+        """
+        native_atoms = [
+            _NativeFormulaAtom(
+                atom.id,
+                atom.page_num,
+                atom.x,
+                atom.y,
+                atom.width,
+                atom.height,
+                atom.markdown,
+                atom.confidence,
+                atom.source,
+            )
+            for atom in atoms
+        ]
+        try:
+            if isinstance(file_data, bytes):
+                native_result = self._native.parse_bytes_with_formula_atoms(file_data, native_atoms)
+            else:
+                file_path = Path(file_data)
+                if not file_path.exists():
+                    raise FileNotFoundError(f"File not found: {file_path}")
+                native_result = self._native.parse_with_formula_atoms(
+                    str(file_path.absolute()), native_atoms
+                )
             return _convert_native_result(native_result)
         except FileNotFoundError:
             raise
