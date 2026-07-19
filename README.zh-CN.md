@@ -1,4 +1,9 @@
-# LiteParse
+# research-pdf-parser / LiteParse 上游文档
+
+> 本仓库的 Python wheel 不编译 Tesseract，高层 `research-pdf-parser` 始终设置
+> `ocr_enabled=False`。下文关于“内置 Tesseract”的内容只适用于启用了相应
+> feature 的上游 LiteParse 构建；本项目遇到扫描页会输出 `scanned-deferred`
+> 日志并跳过。
 
 [![CI](https://github.com/run-llama/liteparse/actions/workflows/ci.yml/badge.svg)](https://github.com/run-llama/liteparse/actions/workflows/ci.yml)
 |

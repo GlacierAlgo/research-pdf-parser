@@ -4,7 +4,14 @@
 > [`research-pdf-parser`](packages/research-pdf-parser) package in one versioned
 > repository. It targets native-vector announcements and formula-heavy research
 > reports; scanned PDFs are logged and skipped. See
-> [RESEARCH_FORK.md](RESEARCH_FORK.md) for the maintained fork boundary.
+> [RESEARCH_FORK.md](RESEARCH_FORK.md) for the maintained fork boundary and
+> [`packages/research-pdf-parser`](packages/research-pdf-parser) for the public
+> `auto`/CPU/GPU-capability interface.
+
+> **OCR boundary:** the upstream LiteParse documentation retained below covers
+> builds compiled with the optional Tesseract feature. This fork's Python wheel
+> is built without Tesseract, and the high-level parser always sets
+> `ocr_enabled=False`; scanned pages are reported as `scanned-deferred`.
 
 # LiteParse upstream documentation
 

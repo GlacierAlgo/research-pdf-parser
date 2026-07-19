@@ -8,7 +8,6 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -17,7 +16,10 @@ import pymupdf
 from liteparse import LiteParse
 
 from .formula_dispatch import FormulaDispatchError, FormulaProcessorRegistry
-from .mineru_remote import RemoteMineruConfig, RemoteMineruError, convert_pdf_on_dgx
+from .markdown_cleanup import (
+    compact_markdown_blank_lines,
+    normalize_table_of_contents,
+)
 
 MATH_FONTS = ("symbol", "math", "cambria", "stix", "times new roman,italic")
 MATH_CHARS = set("=+-*/<>^_{}[]()|→←±×÷≤≥≠≈∑∫√∞σμλαβγδεθρπωΣΠ")
@@ -32,10 +34,6 @@ INLINE_PROSE_RE = re.compile(
 )
 FORMULA_PLACEHOLDER_RE = re.compile(r"\{\{formula:([^}]+)\}\}")
 MARKDOWN_IMAGE_RE = re.compile(r"(!\[[^\]]*\]\()([^\s)]+)([^)]*\))")
-TOC_HEADING_RE = re.compile(r"^(?:#{1,6}\s*)?(?:目\s*录|table\s+of\s+contents|contents)\s*$", re.IGNORECASE)
-TOC_LEADER_RE = re.compile(r"[ \t]*(?:(?:\.[ \t]*){4,}|(?:…[ \t]*){2,}|(?:·[ \t]*){4,})[ \t]*(\d+)")
-TOC_LEADER_ONLY_RE = re.compile(r"[ \t]*(?:(?:\.[ \t]*){4,}|(?:…[ \t]*){2,}|(?:·[ \t]*){4,})[ \t]*")
-TOC_NEXT_ENTRY_RE = re.compile(r"(第\d+页)[ \t]+(?=(?:\d+(?:\.\d+)*\.|附录\s+\d+)\s)")
 FORMULA_CROP_STRATEGY = "tight_white_scaled_v1"
 PAGE_SNAPSHOT_STRATEGY = "page_snapshot"
 CROP_OCR_ENGINES = ("pix2tex", "paddleocr-crop")
@@ -1600,108 +1598,6 @@ def render_formula_markdown(latex: str, kind: str | None) -> str:
     return f"$$\n{stripped}\n$$"
 
 
-def compact_markdown_blank_lines(markdown: str) -> str:
-    """Keep at most one blank line outside fenced code blocks."""
-    result: list[str] = []
-    fence_char: str | None = None
-    fence_width = 0
-
-    for line in markdown.splitlines():
-        stripped = line.lstrip()
-        fence_match = re.match(r"(`{3,}|~{3,})", stripped)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence_char is None:
-                fence_char = marker[0]
-                fence_width = len(marker)
-            elif marker[0] == fence_char and len(marker) >= fence_width:
-                fence_char = None
-                fence_width = 0
-            result.append(line)
-            continue
-
-        if fence_char is None and not line.strip():
-            if result and result[-1] != "":
-                result.append("")
-            continue
-        result.append(line)
-
-    while result and result[-1] == "":
-        result.pop()
-    return "\n".join(result)
-
-
-def normalize_table_of_contents(markdown: str) -> str:
-    """Normalize dot leaders and page labels inside an identified TOC block."""
-    result: list[str] = []
-    in_toc = False
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if TOC_HEADING_RE.fullmatch(stripped):
-            in_toc = True
-            result.append(line)
-            continue
-        is_next_heading = bool(re.match(r"^#{1,6}\s+", stripped))
-        if in_toc and (stripped == "---" or stripped.startswith("<!-- page ") or is_next_heading):
-            in_toc = False
-            result.append(line)
-            continue
-        if not in_toc:
-            result.append(line)
-            continue
-
-        normalized = TOC_LEADER_RE.sub(lambda match: f" ... 第{match.group(1)}页", line)
-        normalized = TOC_LEADER_ONLY_RE.sub(" ... ", normalized).rstrip()
-        normalized = TOC_NEXT_ENTRY_RE.sub(r"\1\n", normalized)
-        result.extend(normalized.splitlines() or [""])
-    return "\n".join(result)
-
-
-def clean_extraction_markers(markdown: str) -> str:
-    """Remove known parser control labels without rewriting document content."""
-    markdown = re.sub(r"(?m)^.*\[Table\\_Title\].*\n?", "", markdown)
-    markdown = markdown.replace("[Table\\_Summary] ", "")
-    markdown = re.sub(r"(?m)^##\s+\[Table\\_R.*$", "## 相关报告", markdown)
-    return markdown.replace(" ", "- ")
-
-
-def table_of_contents_span(markdown: str) -> tuple[int, int] | None:
-    """Return the Markdown character span occupied by the first TOC block."""
-    lines = markdown.splitlines(keepends=True)
-    offset = 0
-    start: int | None = None
-    end: int | None = None
-    for line in lines:
-        stripped = line.strip()
-        if start is None:
-            if TOC_HEADING_RE.fullmatch(stripped):
-                start = offset
-        elif (
-            stripped == "---"
-            or stripped.startswith("<!-- page ")
-            or (re.match(r"^#{1,6}\s+", stripped) and not TOC_HEADING_RE.fullmatch(stripped))
-        ):
-            end = offset
-            break
-        offset += len(line)
-    if start is None:
-        return None
-    return start, len(markdown) if end is None else end
-
-
-def prefer_table_of_contents(markdown: str, reference_markdown: str) -> str:
-    """Replace a damaged TOC with a better extraction of the same source page."""
-    target_span = table_of_contents_span(markdown)
-    reference_span = table_of_contents_span(reference_markdown)
-    if target_span is None or reference_span is None:
-        return markdown
-    reference_toc = normalize_table_of_contents(reference_markdown[reference_span[0] : reference_span[1]].strip())
-    if not reference_toc:
-        return markdown
-    target_start, target_end = target_span
-    return f"{markdown[:target_start]}{reference_toc}\n\n{markdown[target_end:]}"
-
-
 def fill_formula_placeholders(
     markdown: str,
     records: list[FormulaRecord],
@@ -2218,166 +2114,6 @@ def parse_final(
     click.echo(f"final markdown: {output}")
     click.echo(f"filled formula placeholders: {replaced_count}/{result['formula_count']}")
     click.echo(f"benchmark report: {result['report_path']}")
-
-
-@cli.command("parse-cpu")
-@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "-o",
-    "output",
-    type=click.Path(dir_okay=False, path_type=Path),
-    required=True,
-    help="CPU 混合解析生成的 Markdown。",
-)
-@click.option("--pages", help="1-indexed page selection such as '1,4-5'.")
-@click.option("--model", default="PP-FormulaNet_plus-M", show_default=True, help="PaddleOCR 公式识别模型。")
-@click.option("--batch-size", type=click.IntRange(min=1), default=4, show_default=True)
-@click.option("--render-scale", type=click.FloatRange(min=1.0), default=4.0, show_default=True)
-@click.option(
-    "--formula-device",
-    type=click.Choice(["cpu", "dgx"]),
-    default="cpu",
-    show_default=True,
-    help="公式模型运行位置；DGX 使用 SSH 上的 MinerU UniMERNet CUDA。",
-)
-@click.option("--dgx-host", default="dgx-aliyun", show_default=True)
-@click.option(
-    "--no-formula-model",
-    is_flag=True,
-    help="只测试 LiteParse CPU 探针；复杂公式全部使用局部矢量裁剪回退。",
-)
-def parse_cpu(
-    pdf: Path,
-    output: Path,
-    pages: str | None,
-    model: str,
-    batch_size: int,
-    render_scale: float,
-    formula_device: str,
-    dgx_host: str,
-    no_formula_model: bool,
-) -> None:
-    """Parse a native-vector PDF and inject validated formulas into LiteParse Grid."""
-    from .cpu_hybrid import parse_cpu_hybrid
-
-    try:
-        result = parse_cpu_hybrid(
-            pdf,
-            output,
-            pages=pages,
-            model_name=model,
-            batch_size=batch_size,
-            render_scale=render_scale,
-            run_model=not no_formula_model,
-            formula_device=formula_device,
-            dgx_host=dgx_host,
-        )
-    except (RuntimeError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    click.echo(f"markdown: {result.markdown_path}")
-    click.echo(f"report: {result.report_path}")
-    click.echo(f"manifest: {result.manifest_path}")
-    click.echo(
-        "LiteParse={:.3f}s, final Grid={:.3f}s, model init={:.3f}s, inference={:.3f}s; "
-        "native={}, vision={}, latex={}, fallback={}".format(
-            result.parse_seconds,
-            result.reproject_seconds,
-            result.model_init_seconds,
-            result.model_inference_seconds,
-            result.native_count,
-            result.vision_count,
-            result.accepted_latex_count,
-            result.fallback_image_count,
-        )
-    )
-    if result.skipped_pages:
-        click.echo(f"skipped scanned pages: {result.skipped_pages}", err=True)
-
-
-@cli.command("parse-best")
-@click.argument("pdf", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "-o",
-    "output",
-    type=click.Path(dir_okay=False, path_type=Path),
-    required=True,
-    help="Final Markdown output path.",
-)
-@click.option(
-    "--dgx-host",
-    default="dgx-aliyun",
-    envvar="RESEARCH_PDF_PARSER_DGX_HOST",
-    show_default=True,
-    help="SSH host used for the DGX MinerU worker.",
-)
-@click.option(
-    "--remote-uvx",
-    default="~/.local/bin/uvx",
-    envvar="RESEARCH_PDF_PARSER_DGX_UVX",
-    show_default=True,
-    help="uvx executable on the DGX worker.",
-)
-@click.option(
-    "--backend",
-    type=click.Choice(["hybrid-engine", "pipeline"]),
-    default="hybrid-engine",
-    show_default=True,
-    help="MinerU backend. hybrid-engine is the high-accuracy default.",
-)
-@click.option(
-    "--effort",
-    type=click.Choice(["low", "medium", "high"]),
-    default="high",
-    show_default=True,
-    help="MinerU VLM effort for the hybrid backend.",
-)
-@click.option("--keep-remote", is_flag=True, help="Keep the remote run directory for debugging.")
-def parse_best(
-    pdf: Path,
-    output: Path,
-    dgx_host: str,
-    remote_uvx: str,
-    backend: str,
-    effort: str,
-    keep_remote: bool,
-) -> None:
-    """Run the high-accuracy MinerU path on DGX and package local Markdown."""
-    config = RemoteMineruConfig(
-        host=dgx_host,
-        uvx_path=remote_uvx,
-        backend=backend,
-        effort=effort,
-        keep_remote=keep_remote,
-    )
-    try:
-        with TemporaryDirectory(prefix="research-pdf-parser-mineru-") as directory:
-            raw_markdown_path = convert_pdf_on_dgx(pdf, Path(directory), config)
-            markdown = clean_extraction_markers(raw_markdown_path.read_text(encoding="utf-8"))
-
-            with pymupdf.open(pdf) as document:
-                has_toc_candidate_page = document.page_count >= 2
-            if has_toc_candidate_page:
-                try:
-                    toc_pages, _ = liteparse_page_markdown(pdf, "2")
-                    reference_toc = toc_pages.get(2, "")
-                    if reference_toc:
-                        markdown = prefer_table_of_contents(markdown, reference_toc)
-                except Exception as exc:  # TOC repair is an optional secondary parser pass.
-                    click.echo(f"warning: vector TOC repair skipped: {exc}", err=True)
-
-            markdown = compact_markdown_blank_lines(normalize_table_of_contents(markdown))
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(
-                rebundle_markdown_images(markdown, raw_markdown_path, output),
-                encoding="utf-8",
-            )
-    except RemoteMineruError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    click.echo(f"final markdown: {output}")
-    click.echo(f"backend: MinerU {backend} ({effort}) on {dgx_host}")
-    click.echo(f"assets: {markdown_assets_dir(output)}")
 
 
 def main() -> None:

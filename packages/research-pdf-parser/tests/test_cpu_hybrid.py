@@ -4,9 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pymupdf
 
+from research_pdf_parser.assets import materialize_liteparse_images
 from research_pdf_parser.cpu_hybrid import (
     FormulaAtom,
     command_braced_arguments,
@@ -14,14 +16,39 @@ from research_pdf_parser.cpu_hybrid import (
     enrich_factor_atom_context,
     horizontal_rule_bands,
     latex_validation_flags,
-    materialize_embedded_images,
     normalize_recognized_latex,
     render_atom,
+    run_formula_model,
     to_grid_atom,
 )
+from research_pdf_parser.formula_runtime import FormulaPrediction
 
 
 class CPUHybridTests(unittest.TestCase):
+    @mock.patch("research_pdf_parser.cpu_hybrid.PaddleFormulaRuntime")
+    def test_small_model_reject_uses_medium_model_fallback(self, runtime: mock.Mock) -> None:
+        primary = mock.Mock(init_seconds=1.0, device="cpu")
+        primary.predict.return_value = ([FormulaPrediction("x_{", 0.95)], 2.0)
+        fallback = mock.Mock(init_seconds=3.0, device="cpu")
+        fallback.predict.return_value = ([FormulaPrediction(r"DASTD=\sqrt{x}", 0.8)], 4.0)
+        runtime.side_effect = [primary, fallback]
+        atom = FormulaAtom(
+            id="f1",
+            page=1,
+            bbox=(0, 0, 100, 20),
+            route="vision",
+            native_text="D A S T D",
+            confidence=0.9,
+            reasons=[],
+            crop_path=Path("formula.png"),
+        )
+
+        init_seconds, inference_seconds = run_formula_model([atom])
+
+        self.assertEqual((init_seconds, inference_seconds), (4.0, 6.0))
+        self.assertEqual(atom.latex, r"DASTD=\sqrt{x}")
+        self.assertEqual(atom.model_source, "PP-FormulaNet_plus-M:cpu-fallback")
+
     def test_compacts_spaced_pdf_identifiers(self) -> None:
         self.assertEqual(
             compact_formula_spacing("A l p h a _ M o d e l \uf03d c o r r"),
@@ -44,7 +71,7 @@ class CPUHybridTests(unittest.TestCase):
         latex = "STOQ=" + "_{x}" * 20
         self.assertIn("excessive_scripts", latex_validation_flags("S T O Q", latex))
 
-    def test_rejects_balanced_dgx_layout_artifacts(self) -> None:
+    def test_rejects_balanced_model_layout_artifacts(self) -> None:
         self.assertIn(
             "formula_command_noise",
             latex_validation_flags("objective", r"\stackrel{\longrightarrow}{x}"),
@@ -56,6 +83,53 @@ class CPUHybridTests(unittest.TestCase):
         self.assertIn(
             "unbalanced_brackets",
             latex_validation_flags("style", r"f_{s t y[_{e}}X_{style}"),
+        )
+
+    def test_rejects_balanced_but_visibly_corrupt_model_markup(self) -> None:
+        self.assertIn(
+            "escaped_operator_noise",
+            latex_validation_flags("i α β rm", r"r_i=\alpha\ \++\beta r_m"),
+        )
+        self.assertIn(
+            "escaped_text_symbol_noise",
+            latex_validation_flags("DTOA=TD/TA", r"DTOA=TD/TA;\#"),
+        )
+        self.assertIn(
+            "unexpected_latex_linebreak",
+            latex_validation_flags("Z(T)=sum tau", r"\cdot\\ \Psi Z(T)=\sum_\tau"),
+        )
+        self.assertIn(
+            "unexpected_greek:Psi",
+            latex_validation_flags("Z(T)=sum tau", r"\Psi Z(T)=\sum_\tau"),
+        )
+        self.assertIn(
+            "nested_script_operator",
+            latex_validation_flags("Y i+1", r"Y_{_i}=x"),
+        )
+        self.assertIn("punctuation_near_equals", latex_validation_flags("R=", r"R_{t+d},=x"))
+        self.assertIn(
+            "terminal_k_index_mismatch",
+            latex_validation_flags("f k1 epsilon k1 f k2 epsilon k2 K epsilon", r"f_K\varepsilon_{K2}+\ldots"),
+        )
+
+    def test_repairs_redundant_superscript_operator(self) -> None:
+        self.assertEqual(
+            normalize_recognized_latex(r"IC_{_{AlphaModel}}^{^t}=R_{_{t+1}}"),
+            r"IC_{AlphaModel}^{t}=R_{t+1}",
+        )
+
+    def test_normalizes_safe_model_command_noise(self) -> None:
+        self.assertEqual(
+            normalize_recognized_latex(r"RSTR=\operatorname{\ln}(x)\;;"),
+            r"RSTR=\ln(x);",
+        )
+        self.assertEqual(
+            normalize_recognized_latex(r"EPIBS=est\quad_{-}\quad eps/P"),
+            r"EPIBS=est_{eps}/P",
+        )
+        self.assertEqual(
+            normalize_recognized_latex(r"HSIGMA=s\quad T D(e_i);"),
+            r"HSIGMA=STD(e_i);",
         )
 
     def test_requires_standalone_k_identifier_from_native_formula(self) -> None:
@@ -203,7 +277,7 @@ class CPUHybridTests(unittest.TestCase):
             output = root / "out.md"
             parsed = SimpleNamespace(images=[SimpleNamespace(id="p2_0", page=2, format="png", bytes=b"image")])
             markdown = "<!-- page 2 -->\n\n正文"
-            rendered = materialize_embedded_images(parsed, markdown, output, root / "out_assets")
+            rendered = materialize_liteparse_images(parsed, markdown, output, root / "out_assets")
             self.assertIn("out_assets/images/image_p2_0.png", rendered)
             self.assertEqual((root / "out_assets/images/image_p2_0.png").read_bytes(), b"image")
 

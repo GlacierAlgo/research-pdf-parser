@@ -17,10 +17,22 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("● parse", result.output)
-        self.assertIn("├─ native-fast", result.output)
+        self.assertIn("├─ auto", result.output)
         self.assertIn("├─ formula-cpu", result.output)
-        self.assertIn("└─ legacy-placeholders", result.output)
-        self.assertIn("● formula", result.output)
+        self.assertIn("└─ formula-best", result.output)
+        self.assertIn("● serve", result.output)
+        self.assertIn("└─ formula", result.output)
+        self.assertIn("● experiment", result.output)
+        self.assertIn("├─ legacy-placeholders", result.output)
+        self.assertNotIn("DGX", result.output)
+
+    def test_formula_profile_exposes_device_detection_and_http_endpoint(self) -> None:
+        result = CliRunner().invoke(cli, ["parse", "formula-cpu", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("[auto|cpu|gpu]", result.output)
+        self.assertIn("http://10.0.0.8/formula_ocr", result.output)
+        self.assertNotIn("--dgx-host", result.output)
 
     def test_doctor_reports_patched_liteparse(self) -> None:
         result = CliRunner().invoke(cli, ["doctor", "--json-output", "--strict"])
@@ -29,6 +41,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(result.output)
         liteparse = next(item for item in payload if item["name"] == "liteparse-formula-atom")
         self.assertTrue(liteparse["available"])
+        self.assertTrue(any(item["name"] == "local-gpu" for item in payload))
 
     def test_native_fast_writes_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -47,6 +60,45 @@ class CliTests(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertIn("Native vector research report", output.read_text(encoding="utf-8"))
             self.assertFalse((root / "output_assets").exists())
+
+    def test_auto_writes_optional_sparse_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "input.pdf"
+            output = root / "output.md"
+            result_json = root / "result.json"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "Simple native announcement")
+            document.save(pdf)
+            document.close()
+
+            result = CliRunner().invoke(
+                cli,
+                ["parse", "auto", str(pdf), "-o", str(output), "--result-json", str(result_json)],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result_json.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema"], "research-pdf-parser.result.v1")
+            self.assertEqual(payload["actual_profile"], "native-fast")
+            self.assertEqual(payload["quality"]["status"], "ok")
+            self.assertTrue(payload["blocks"])
+
+    def test_probe_is_human_readable_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "input.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "Simple native announcement")
+            document.save(pdf)
+            document.close()
+
+            result = CliRunner().invoke(cli, ["probe", str(pdf)])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("recommended: native-fast", result.output)
+            self.assertIn("page  chars  formula", result.output)
 
 
 if __name__ == "__main__":

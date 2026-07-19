@@ -9,11 +9,10 @@ crisp vector crop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
-import shlex
-import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,31 +23,16 @@ import pymupdf
 from liteparse import FormulaAtom as GridFormulaAtom
 from liteparse import LiteParse
 
-PRIVATE_USE_REPLACEMENTS = {
-    "\uf02b": "+",
-    "\uf02d": "−",
-    "\uf03c": "<",
-    "\uf03d": "=",
-    "\uf03e": ">",
-    "\uf061": "α",
-    "\uf062": "β",
-    "\uf065": "ε",
-    "\uf06d": "μ",
-    "\uf073": "σ",
-    "\uf074": "τ",
-    "\uf078": "ξ",
-    "\uf0a2": "′",
-    "\uf0a3": "≤",
-    "\uf0ae": "→",
-    "\uf0b1": "±",
-    "\uf0b3": "≥",
-    "\uf0d7": "⋅",
-    "\uf0e5": "∑",
-    "\uf0ec": "⎧",
-    "\uf0ed": "⎨",
-    "\uf0ee": "⎩",
-    "\uf0ef": "⎪",
-}
+from .assets import materialize_liteparse_images
+from .formula_runtime import PaddleFormulaRuntime
+from .formula_service import recognize_formula_files
+from .markdown_cleanup import normalize_markdown
+from .pdf_utils import (
+    normalize_private_use,
+    resolve_page_numbers,
+    scanned_page_reason,
+)
+
 IMPORTANT_IDENTIFIERS = (
     "alphamodel",
     "industry",
@@ -72,41 +56,6 @@ IMPORTANT_IDENTIFIERS = (
 )
 NOISE_RE = re.compile(r"数量化专题报告|请务必阅读正文之后|\b\d+\s+of\s+\d+\b")
 HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)+\.?\s+|\d+\.\s+|附录\s*\d*)")
-DGX_FORMULA_RUNNER = r"""
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-import cv2
-
-from mineru.model.mfr.unimernet.Unimernet import UnimernetModel
-from mineru.utils.enum_class import ModelPath
-from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
-
-input_dir = Path(sys.argv[1])
-files = sorted(input_dir.glob("*.png"))
-relative = ModelPath.unimernet_small
-root = auto_download_and_get_model_root_path(relative)
-start = time.perf_counter()
-model = UnimernetModel(os.path.join(root, relative), "cuda")
-init_seconds = time.perf_counter() - start
-images = [cv2.imread(str(path)) for path in files]
-if any(image is None for image in images):
-    raise RuntimeError("failed to read one or more formula crops")
-detections = [
-    [{"bbox": [0, 0, image.shape[1], image.shape[0]], "label": "display_formula"}]
-    for image in images
-]
-start = time.perf_counter()
-results = model.batch_predict(detections, images, batch_size=int(sys.argv[2]))
-inference_seconds = time.perf_counter() - start
-print(json.dumps({"_meta": {"init_seconds": init_seconds, "inference_seconds": inference_seconds}}))
-for path, result in zip(files, results):
-    latex = result[0].get("latex", "") if result else ""
-    print(json.dumps({"id": path.stem, "latex": latex}, ensure_ascii=False))
-"""
 
 
 @dataclass
@@ -149,12 +98,6 @@ class RuleBand:
     bottom: float
 
 
-def normalize_private_use(text: str) -> str:
-    for source, replacement in PRIVATE_USE_REPLACEMENTS.items():
-        text = text.replace(source, replacement)
-    return "".join(ch for ch in text if not 0xE000 <= ord(ch) <= 0xF8FF)
-
-
 def compact_formula_spacing(text: str) -> str:
     text = normalize_private_use(text)
     # PDF glyph runs often spell identifiers as "A l p h a". Only collapse
@@ -169,7 +112,7 @@ def compact_formula_spacing(text: str) -> str:
 
 def normalize_recognized_latex(latex: str) -> str:
     """Repair harmless PDF-style letter spacing without guessing semantics."""
-    separator = r"(?:\s+|\s*\\[,;:!]\s*)"
+    separator = r"(?:\s+|\s*\\(?:[,;:!]|quad|qquad)\s*)"
     replacements = {
         "industry": "industry",
         "style": "style",
@@ -178,6 +121,11 @@ def normalize_recognized_latex(latex: str) -> str:
         "RSTR": "RSTR",
         "EPIBS": "EPIBS",
         "DTOA": "DTOA",
+        "TD": "TD",
+        "TA": "TA",
+        "ME": "ME",
+        "LD": "LD",
+        "BE": "BE",
         "HSIGMA": "HSIGMA",
         "BLEV": "BLEV",
         "MLEV": "MLEV",
@@ -217,6 +165,9 @@ def normalize_recognized_latex(latex: str) -> str:
         flags=re.IGNORECASE,
     )
     normalized = normalized.replace(r"\mathrm{\exp}", r"\exp")
+    normalized = normalized.replace(r"\operatorname{\ln}", r"\ln")
+    normalized = normalized.replace(r"\text{\max}", r"\max")
+    normalized = normalized.replace(r"\text{\min}", r"\min")
     normalized = re.sub(
         r"\\textsuperscript\s*\{\s*\\textit\s*\{\s*([^{}]+?)\s*\}\s*\}",
         lambda match: "^{" + match.group(1).strip() + "}",
@@ -224,11 +175,23 @@ def normalize_recognized_latex(latex: str) -> str:
     )
     normalized = normalized.replace(r"D\mathop{T O A}", "DTOA")
     normalized = normalized.replace(r"\mathop{T D}", "TD")
+    normalized = normalized.replace(r"\mathop{TD}", "TD")
     normalized = normalized.replace(r"\mathop{T A}", "TA")
+    normalized = normalized.replace(r"\mathop{TA}", "TA")
     normalized = normalized.replace(r"\mathop{/}", "/")
     normalized = normalized.replace(r"B\mathop{{L}{E}{V}}", "BLEV")
     normalized = normalized.replace(r"\mathop{{B}{E}}", "BE")
     normalized = normalized.replace(r"\mathop{{L}{D}}", "LD")
+    # PP-FormulaNet occasionally recognizes ``S T D`` in two passes: the
+    # generic identifier repair above first turns ``T D`` into ``TD``, leaving
+    # ``s TD`` behind. Finish that deterministic repair here so HSIGMA table
+    # cells remain readable without adding any semantic guesswork.
+    normalized = re.sub(
+        r"(?<![A-Za-z])s(?:\s+|\s*\\(?:[,;:!]|quad|qquad)\s*)*TD(?![A-Za-z])",
+        "STD",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     normalized = re.sub(r"HSIGMA(?:\s*\\quad\s*)+HSIGMA", "HSIGMA", normalized)
     normalized = re.sub(r"(?<=MLEV=\()M\s+E", "ME", normalized)
     normalized = re.sub(r"(?<=\+)L\s+D", "LD", normalized)
@@ -238,6 +201,19 @@ def normalize_recognized_latex(latex: str) -> str:
         "CETOP",
         normalized,
     )
+    normalized = re.sub(r"est\s*\\quad\s*_\{-\}\s*\\quad\s*eps", r"est_{eps}", normalized)
+    normalized = re.sub(r"(?:\\;)+;+", ";", normalized)
+    normalized = re.sub(r";{2,}", ";", normalized)
+    for _ in range(6):
+        previous = normalized
+        normalized = re.sub(r"\{\s*\}", "", normalized)
+        normalized = re.sub(r"([_^])\{\s*\{([^{}]+)\}\s*\}", r"\1{\2}", normalized)
+        normalized = re.sub(r"_\{\s*_\{([^{}]+)\}\s*\}", r"_{\1}", normalized)
+        normalized = re.sub(r"\^\{\s*\^\{([^{}]+)\}\s*\}", r"^{\1}", normalized)
+        normalized = re.sub(r"_\{\s*_([A-Za-z0-9]+)\s*\}", r"_{\1}", normalized)
+        normalized = re.sub(r"\^\{\s*\^([A-Za-z0-9]+)\s*\}", r"^{\1}", normalized)
+        if normalized == previous:
+            break
     return normalized.strip()
 
 
@@ -267,43 +243,6 @@ def command_braced_arguments(latex: str, command: str) -> list[str]:
                     break
         else:
             return arguments
-
-
-def resolve_page_numbers(document: pymupdf.Document, pages: str | None) -> list[int]:
-    if not pages:
-        return list(range(1, document.page_count + 1))
-    selected: set[int] = set()
-    for part in pages.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_text, end_text = part.split("-", 1)
-            start, end = int(start_text), int(end_text)
-            if start > end:
-                raise ValueError(f"页码范围无效：{part}")
-            selected.update(range(start, end + 1))
-        else:
-            selected.add(int(part))
-    if not selected or min(selected) < 1 or max(selected) > document.page_count:
-        raise ValueError(f"页码必须位于 1-{document.page_count}")
-    return sorted(selected)
-
-
-def scanned_page_reason(page: pymupdf.Page) -> str | None:
-    native_chars = len(re.sub(r"\s+", "", page.get_text("text")))
-    largest_image_ratio = 0.0
-    page_area = max(page.rect.width * page.rect.height, 1.0)
-    for image in page.get_images(full=True):
-        try:
-            rects = page.get_image_rects(image[0])
-        except Exception:
-            continue
-        for rect in rects:
-            largest_image_ratio = max(largest_image_ratio, rect.width * rect.height / page_area)
-    if native_chars < 20 and largest_image_ratio >= 0.55:
-        return f"native_chars={native_chars}, largest_image={largest_image_ratio:.0%}"
-    return None
 
 
 def atom_from_candidate(page_number: int, candidate: Any) -> FormulaAtom:
@@ -358,151 +297,87 @@ def render_formula_crops(
             atom.crop_path = path
 
 
-def _paddle_result(result: Any) -> dict[str, Any]:
-    payload: Any = result
-    if not isinstance(payload, dict):
-        payload = getattr(result, "json", None)
-        if callable(payload):
-            payload = payload()
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        if not isinstance(payload, dict):
-            try:
-                payload = dict(result)
-            except (TypeError, ValueError):
-                return {}
-    payload = payload.get("res", payload)
-    return payload if isinstance(payload, dict) else {}
-
-
 def run_formula_model(
     atoms: list[FormulaAtom],
-    model_name: str = "PP-FormulaNet_plus-M",
+    model_name: str = "PP-FormulaNet_plus-S",
+    fallback_model_name: str | None = "PP-FormulaNet_plus-M",
+    batch_size: int = 4,
+    device: str = "auto",
+) -> tuple[float, float]:
+    pending = sorted(
+        [atom for atom in atoms if atom.route == "vision" and atom.crop_path],
+        key=lambda atom: (round(atom.bbox[3] / 16), round(atom.bbox[2] / 32), atom.id),
+    )
+    if not pending:
+        return 0.0, 0.0
+    runtime = PaddleFormulaRuntime(model_name=model_name, device=device)
+    predictions, inference_seconds = runtime.predict(
+        [atom.crop_path for atom in pending if atom.crop_path],
+        batch_size=batch_size,
+    )
+    for atom, prediction in zip(pending, predictions, strict=False):
+        atom.latex = normalize_recognized_latex(prediction.latex)
+        atom.model_score = prediction.score
+        atom.model_source = f"{model_name}:{runtime.device}"
+
+    init_seconds = runtime.init_seconds
+    retry = [atom for atom in pending if latex_validation_flags(atom.native_text, atom.latex, atom.model_score)]
+    if retry and fallback_model_name and fallback_model_name != model_name:
+        fallback = PaddleFormulaRuntime(model_name=fallback_model_name, device=device)
+        fallback_predictions, fallback_seconds = fallback.predict(
+            [atom.crop_path for atom in retry if atom.crop_path],
+            batch_size=max(1, min(batch_size, 2)),
+        )
+        init_seconds += fallback.init_seconds
+        inference_seconds += fallback_seconds
+        for atom, prediction in zip(retry, fallback_predictions, strict=False):
+            candidate = normalize_recognized_latex(prediction.latex)
+            current_flags = latex_validation_flags(atom.native_text, atom.latex, atom.model_score)
+            candidate_flags = latex_validation_flags(atom.native_text, candidate, prediction.score)
+            current_score = atom.model_score if atom.model_score is not None else -1.0
+            candidate_score = prediction.score if prediction.score is not None else -1.0
+            if len(candidate_flags) < len(current_flags) or (
+                len(candidate_flags) == len(current_flags) and candidate_score > current_score
+            ):
+                atom.latex = candidate
+                atom.model_score = prediction.score
+                atom.model_source = f"{fallback_model_name}:{fallback.device}-fallback"
+    return init_seconds, inference_seconds
+
+
+def run_formula_model_http(
+    atoms: list[FormulaAtom],
+    server_url: str,
     batch_size: int = 4,
 ) -> tuple[float, float]:
     pending = [atom for atom in atoms if atom.route == "vision" and atom.crop_path]
     if not pending:
         return 0.0, 0.0
-    os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-    try:
-        from paddleocr import FormulaRecognition
-    except ImportError as exc:
-        raise RuntimeError(
-            "CPU 公式模型未安装。请用 `uv run --with 'paddleocr[doc-parser]' "
-            "--with paddlepaddle python main.py parse-cpu ...` 运行。"
-        ) from exc
-
-    start = time.perf_counter()
-    model = FormulaRecognition(model_name=model_name, device="cpu", engine="paddle_static")
-    init_seconds = time.perf_counter() - start
-    start = time.perf_counter()
-    results = list(
-        model.predict(
-            input=[str(atom.crop_path) for atom in pending],
-            batch_size=batch_size,
-        )
+    response = recognize_formula_files(
+        server_url,
+        [(atom.id, atom.crop_path) for atom in pending if atom.crop_path],
+        batch_size=batch_size,
     )
-    inference_seconds = time.perf_counter() - start
-    for atom, raw in zip(pending, results, strict=False):
-        result = _paddle_result(raw)
-        latex = result.get("rec_formula")
-        if isinstance(latex, str):
-            atom.latex = normalize_recognized_latex(latex)
-        score = result.get("rec_score")
-        if score is not None:
-            try:
-                atom.model_score = float(score.item() if hasattr(score, "item") else score)
-            except (TypeError, ValueError):
-                atom.model_score = None
-        atom.model_source = f"{model_name}:cpu"
-    return init_seconds, inference_seconds
-
-
-def run_formula_model_dgx(
-    atoms: list[FormulaAtom],
-    host: str = "dgx-aliyun",
-    batch_size: int = 8,
-    uvx_path: str = "~/.local/bin/uvx",
-) -> tuple[float, float]:
-    """Run MinerU's UniMERNet directly on formula crops through SSH."""
-    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
-        raise RuntimeError(f"DGX SSH host 不安全：{host!r}")
-    pending = [atom for atom in atoms if atom.route == "vision" and atom.crop_path]
-    if not pending:
-        return 0.0, 0.0
-
-    def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(args, check=True, text=True, **kwargs)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"缺少 DGX 调用命令：{args[0]}") from exc
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or "").strip()
-            raise RuntimeError(f"DGX 公式推理失败：{detail or exc}") from exc
-
-    home = run(
-        ["ssh", "-o", "BatchMode=yes", host, 'printf "%s" "$HOME"'],
-        capture_output=True,
-    ).stdout.strip()
-    if not home.startswith("/"):
-        raise RuntimeError("无法解析 DGX HOME")
-    resolved_uvx = f"{home}/{uvx_path[2:]}" if uvx_path.startswith("~/") else uvx_path
-    remote_dir = run(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            host,
-            "mkdir -p ~/.cache/research-pdf-parser/formula-runs && "
-            "mktemp -d ~/.cache/research-pdf-parser/formula-runs/run.XXXXXX",
-        ],
-        capture_output=True,
-    ).stdout.strip()
-    expected_prefix = f"{home}/.cache/research-pdf-parser/formula-runs/run."
-    if not remote_dir.startswith(expected_prefix):
-        raise RuntimeError(f"DGX 临时目录异常：{remote_dir!r}")
-
-    try:
-        run(["scp", *[str(atom.crop_path) for atom in pending], f"{host}:{remote_dir}/"])
-        command = (
-            f"MINERU_MODEL_SOURCE=modelscope {shlex.quote(resolved_uvx)} "
-            "--managed-python --python 3.12 --from 'mineru[all]' "
-            f"python - {shlex.quote(remote_dir)} {int(batch_size)}"
-        )
-        completed = run(
-            ["ssh", "-o", "BatchMode=yes", host, command],
-            input=DGX_FORMULA_RUNNER,
-            capture_output=True,
-        )
-    finally:
-        run(
-            ["ssh", "-o", "BatchMode=yes", host, f"rm -rf -- {shlex.quote(remote_dir)}"],
-            capture_output=True,
-        )
-
     by_id = {atom.id: atom for atom in pending}
-    init_seconds = inference_seconds = 0.0
     seen: set[str] = set()
-    for line in completed.stdout.splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if "_meta" in payload:
-            init_seconds = float(payload["_meta"].get("init_seconds", 0.0))
-            inference_seconds = float(payload["_meta"].get("inference_seconds", 0.0))
-            continue
-        atom = by_id.get(str(payload.get("id", "")))
+    for item in response["results"]:
+        atom = by_id.get(str(item.get("id", "")))
         if atom is None:
             continue
-        atom.latex = normalize_recognized_latex(str(payload.get("latex", "")))
-        atom.model_source = "mineru-unimernet-small:dgx-cuda"
+        atom.latex = normalize_recognized_latex(str(item.get("latex", "")))
+        score = item.get("score")
+        atom.model_score = float(score) if score is not None else None
+        atom.model_source = (
+            f"{response.get('model', 'formula-service')}:"
+            f"{response.get('device', 'remote')}-http"
+        )
         seen.add(atom.id)
     missing = sorted(set(by_id) - seen)
     if missing:
-        raise RuntimeError(f"DGX 未返回 {len(missing)} 个公式结果：{missing[:5]}")
-    return init_seconds, inference_seconds
+        raise RuntimeError(f"Formula service omitted {len(missing)} result(s): {missing[:5]}")
+    # A persistent service paid model startup before this document request.
+    # Keep per-document timings honest; /health exposes the service cold start.
+    return 0.0, float(response.get("inference_seconds", 0.0))
 
 
 def latex_validation_flags(native_text: str, latex: str, score: float | None = None) -> list[str]:
@@ -516,6 +391,46 @@ def latex_validation_flags(native_text: str, latex: str, score: float | None = N
         flags.append("unbalanced_parentheses")
     if stripped.count("[") != stripped.count("]"):
         flags.append("unbalanced_brackets")
+    if re.search(r"\\[+=-]", stripped):
+        flags.append("escaped_operator_noise")
+    if re.search(r"\\[#%&]", stripped):
+        flags.append("escaped_text_symbol_noise")
+    if re.search(r"[,;:]\s*=|=\s*[,;:]", stripped):
+        flags.append("punctuation_near_equals")
+    if "\\\\" in stripped and "\\begin{" not in stripped:
+        flags.append("unexpected_latex_linebreak")
+    if re.search(r"(?:_\{\s*_\^?|\^\{\s*\^)", stripped):
+        flags.append("nested_script_operator")
+    if (
+        r"\ldots" in stripped
+        and re.search(r"f_\{?K\}?", stripped)
+        and not re.search(r"\\varepsilon_\{?K\}?(?!\d)", stripped)
+    ):
+        flags.append("terminal_k_index_mismatch")
+
+    native_symbols = normalize_private_use(native_text)
+    greek_commands = {
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\delta": "δ",
+        r"\epsilon": "ε",
+        r"\varepsilon": "ε",
+        r"\theta": "θ",
+        r"\lambda": "λ",
+        r"\mu": "μ",
+        r"\rho": "ρ",
+        r"\sigma": "σ",
+        r"\tau": "τ",
+        r"\phi": "φ",
+        r"\psi": "ψ",
+        r"\Psi": "Ψ",
+        r"\omega": "ω",
+    }
+    for command, symbol in greek_commands.items():
+        if command in stripped and symbol not in native_symbols:
+            command_name = command[1:] if command.startswith("\\") else command
+            flags.append(f"unexpected_greek:{command_name}")
     if len(re.findall(r"\\left\b", stripped)) != len(re.findall(r"\\right\b", stripped)):
         flags.append("unbalanced_left_right")
     begins = re.findall(r"\\begin\{([^}]+)\}", stripped)
@@ -992,42 +907,10 @@ def write_manifest(atoms: list[FormulaAtom], path: Path) -> None:
         for atom in atoms:
             payload = asdict(atom)
             payload["crop_path"] = str(atom.crop_path) if atom.crop_path else None
+            payload["crop_sha256"] = (
+                hashlib.sha256(atom.crop_path.read_bytes()).hexdigest() if atom.crop_path else None
+            )
             file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def materialize_embedded_images(
-    parsed: Any,
-    markdown: str,
-    output_path: Path,
-    assets_dir: Path,
-) -> str:
-    if not parsed or not parsed.images:
-        return markdown
-    images_dir = assets_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    refs_by_page: dict[int, list[tuple[str, str]]] = {}
-    for image in parsed.images:
-        filename = f"image_{image.id}.{image.format}"
-        path = images_dir / filename
-        path.write_bytes(image.bytes)
-        reference = _relative_asset(path, output_path)
-        refs_by_page.setdefault(int(image.page), []).append((filename, reference))
-        markdown = markdown.replace(f"]({filename})", f"]({reference})")
-
-    sections = markdown.split("\n\n---\n\n")
-    for index, section in enumerate(sections):
-        match = re.search(r"<!-- page (\d+) -->", section)
-        if not match:
-            continue
-        page_number = int(match.group(1))
-        missing = [
-            f"![]({reference})"
-            for _filename, reference in refs_by_page.get(page_number, [])
-            if reference not in section
-        ]
-        if missing:
-            sections[index] = section.rstrip() + "\n\n" + "\n\n".join(missing)
-    return "\n\n---\n\n".join(sections)
 
 
 def write_report(result: CPUHybridResult, atoms: list[FormulaAtom], output_path: Path) -> None:
@@ -1064,12 +947,13 @@ def parse_cpu_hybrid(
     pdf_path: Path,
     output_path: Path,
     pages: str | None = None,
-    model_name: str = "PP-FormulaNet_plus-M",
+    model_name: str = "PP-FormulaNet_plus-S",
+    fallback_model_name: str | None = "PP-FormulaNet_plus-M",
     batch_size: int = 4,
     render_scale: float = 4.0,
     run_model: bool = True,
-    formula_device: str = "cpu",
-    dgx_host: str = "dgx-aliyun",
+    formula_device: str = "auto",
+    formula_server_url: str | None = None,
 ) -> CPUHybridResult:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     assets_dir = output_path.parent / f"{output_path.stem}_assets"
@@ -1112,17 +996,19 @@ def parse_cpu_hybrid(
     render_formula_crops(pdf_path, atoms, crops_dir, scale=render_scale)
     model_init_seconds = model_inference_seconds = 0.0
     if run_model:
-        if formula_device == "dgx":
-            model_init_seconds, model_inference_seconds = run_formula_model_dgx(
+        if formula_server_url:
+            model_init_seconds, model_inference_seconds = run_formula_model_http(
                 atoms,
-                host=dgx_host,
+                formula_server_url,
                 batch_size=batch_size,
             )
-        elif formula_device == "cpu":
+        elif formula_device in {"auto", "cpu", "gpu"}:
             model_init_seconds, model_inference_seconds = run_formula_model(
                 atoms,
                 model_name=model_name,
+                fallback_model_name=fallback_model_name,
                 batch_size=batch_size,
+                device=formula_device,
             )
         else:
             raise ValueError(f"未知公式推理设备：{formula_device}")
@@ -1151,8 +1037,8 @@ def parse_cpu_hybrid(
         page = final_pages[page_number]
         body = normalize_private_use(page.markdown or page.text).strip()
         page_markdown.append(f"<!-- page {page_number} -->\n\n{body}".strip())
-    markdown = "\n\n---\n\n".join(page_markdown).strip()
-    markdown = materialize_embedded_images(final_parsed, markdown, output_path, assets_dir)
+    markdown = normalize_markdown("\n\n---\n\n".join(page_markdown).strip())
+    markdown = materialize_liteparse_images(final_parsed, markdown, output_path, assets_dir)
     output_path.write_text(markdown + "\n", encoding="utf-8")
 
     manifest_path = assets_dir / "formula_manifest.jsonl"

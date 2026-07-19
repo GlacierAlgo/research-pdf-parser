@@ -5,11 +5,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pymupdf
 from liteparse import LiteParse
 
-from .cpu_hybrid import materialize_embedded_images, normalize_private_use, resolve_page_numbers, scanned_page_reason
+from .assets import materialize_liteparse_images
+from .markdown_cleanup import normalize_markdown
+from .pdf_utils import normalize_private_use, resolve_page_numbers, scanned_page_reason
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ def parse_native_pdf(
     *,
     pages: str | None = None,
     image_mode: str = "off",
+    parsed: Any | None = None,
 ) -> NativeParseResult:
     """Parse native-vector pages once and write canonical Markdown."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,9 +44,8 @@ def parse_native_pdf(
         }
 
     active_pages = [page_number for page_number in selected_pages if page_number not in skipped]
-    parsed = None
     start = time.perf_counter()
-    if active_pages:
+    if active_pages and parsed is None:
         parser = LiteParse(
             output_format="markdown",
             target_pages=",".join(map(str, active_pages)),
@@ -66,8 +69,8 @@ def parse_native_pdf(
         body = normalize_private_use(page.markdown or page.text).strip()
         sections.append(f"<!-- page {page_number} -->\n\n{body}".strip())
 
-    markdown = "\n\n---\n\n".join(sections).strip()
-    markdown = materialize_embedded_images(parsed, markdown, output_path, assets_dir)
+    markdown = normalize_markdown("\n\n---\n\n".join(sections).strip())
+    markdown = materialize_liteparse_images(parsed, markdown, output_path, assets_dir)
     output_path.write_text(markdown + "\n", encoding="utf-8")
     return NativeParseResult(
         markdown_path=output_path,
